@@ -1,0 +1,14 @@
+[package]
+name = "fractus-py"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+fractus-core = { path = "../fractus-core" }
+# pyo3 0.22 only supports Python ≤3.13; the target venv is 3.14 → we bump to 0.29.
+pyo3 = { version = "0.29", features = ["extension-module"] }

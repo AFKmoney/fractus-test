@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual env
+.venv/
+venv/
+
+# Rust
+target/
+**/*.rs.bk
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / checkpoints
+*.log
+checkpoints/
+
+# Benchmark artifacts (local measurements, regenerated per-machine)
+scripts/bench_*.json
+
+# Downloaded datasets (too large for git)
+data/text/tinyshakespeare.txt
+data/text/*.txt
+data/hf_cache/
+
+# TensorBoard
+runs/
+events.out.tfevents.*
+
+# Windows reserved names accidentally created (e.g. by shell redirects)
+nul
+NUL
+CON
+PRN
+AUX
+checkpoints/
+*.onnx.data
+*.pt
+training_*.log
+*.onnx.data
+
+# Training artifacts (regenerated, don't track)
+*.onnx
+*.onnx.data
+training_*.log
+training_*.txt
+continuous_training.log
+checkpoints/
+data/fractus_corpus.pt

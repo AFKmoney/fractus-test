@@ -1,0 +1,8 @@
+# Runtime dependencies of fractus.
+# PyTorch CPU-only on Windows:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+torch>=2.2,<3.0
+numpy>=1.26,<3.0
+datasets>=2.14,<4.0
+huggingface_hub>=0.20

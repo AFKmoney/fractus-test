@@ -1,0 +1,29 @@
+# fractus — Python package built via maturin (Rust backend).
+# The native module comes from crate/fractus-py; the Python package comes from fractus/.
+
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "fractus"
+version = "0.1.0"
+description = "Unified rebuild of the original systems: a trainable fractal transformer."
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "maturin>=1.4,<2.0",
+]
+
+[tool.maturin]
+# The native module (cdylib _core) will be placed in fractus/ → imported as fractus._core.
+python-source = "."
+module-name = "fractus._core"
+manifest-path = "crate/fractus-py/Cargo.toml"
+features = ["pyo3/extension-module"]

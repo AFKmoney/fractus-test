@@ -1,0 +1,7 @@
+# Fractus Space — HuggingFace Space dependencies
+# These are installed by HF Spaces on top of the base image.
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+torch
+numpy

@@ -68,3 +68,26 @@ def test_make_hidden_bank_shape_and_alignment():
         # The first sampled pair uses tokens at consecutive corpus positions.
         # We only check that h_in != h_target (otherwise the target is trivial).
         assert not torch.equal(bank["h_in"][0], bank["h_target"][0])
+
+
+def test_phase1_shared_reduces_mse_on_bank():
+    eng = ablib.build_engine(seed=42)
+    tokens = torch.arange(2000, dtype=torch.int64) % 50257
+    bank = ablib.make_hidden_bank(eng, tokens, chunk_len=32, n_chunks=20, seed=0)
+    mse_before = ablib._eval_expert_mse(eng, 0, bank)
+    ablib.phase1_experts_shared(eng, bank, steps=20, lr=1e-2, seed=0)
+    mse_after = ablib._eval_expert_mse(eng, 0, bank)
+    # Training must reduce the expert's MSE on its own training bank.
+    assert mse_after < mse_before
+
+
+def test_phase1_partitioned_trains_each_expert_on_own_bank():
+    eng = ablib.build_engine(seed=42)
+    tokens = torch.arange(2000, dtype=torch.int64) % 50257
+    banks = [ablib.make_hidden_bank(eng, tokens[:500], chunk_len=32, n_chunks=8, seed=i)
+             for i in range(4)]
+    mse_before = [ablib._eval_expert_mse(eng, i, banks[i]) for i in range(4)]
+    ablib.phase1_experts_partitioned(eng, banks, steps=15, lr=1e-2, seed=0)
+    mse_after = [ablib._eval_expert_mse(eng, i, banks[i]) for i in range(4)]
+    for i in range(4):
+        assert mse_after[i] < mse_before[i], f"expert {i} did not improve"

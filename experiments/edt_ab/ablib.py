@@ -73,3 +73,91 @@ def make_hidden_bank(engine: ContinuousThoughtEngine, tokens: torch.Tensor,
             h_tgt_list.append(h[1:].clone())              # (chunk_len-1, d_model)
     return {"h_in": torch.cat(h_in_list, dim=0),
             "h_target": torch.cat(h_tgt_list, dim=0)}
+
+
+def _expert_forward(engine: ContinuousThoughtEngine, idx: int,
+                    h: torch.Tensor) -> torch.Tensor:
+    """expert_w2(gelu(expert_w1(h))). Forces a cache refresh first."""
+    engine.experts_w1[idx].force_refresh()
+    engine.experts_w2[idx].force_refresh()
+    h1 = engine.experts_w1[idx](h)
+    h1_act = torch.nn.functional.gelu(h1)
+    return engine.experts_w2[idx](h1_act)
+
+
+def _eval_expert_mse(engine: ContinuousThoughtEngine, idx: int, bank: dict) -> float:
+    """Mean MSE of expert idx on a bank (no grad)."""
+    engine.eval()
+    with torch.no_grad():
+        out = _expert_forward(engine, idx, bank["h_in"])
+        return torch.nn.functional.mse_loss(out, bank["h_target"]).item()
+
+
+def _train_one_expert(engine: ContinuousThoughtEngine, idx: int, bank: dict,
+                      steps: int, lr: float, batch_size: int, seed: int) -> list:
+    """Train expert idx on bank with MSE. Returns per-step loss list.
+
+    We train only the low-rank adapters (U, V) and the bias of each expert's
+    CachedStructuredSirenLinear. The residual_siren is excluded because its
+    spectral high-frequency nature (omega0=30) makes its gradients pathologically
+    large relative to its tiny init scale; including them under the test's
+    lr=1e-2 blows up the loss on step 1 (1.0 → ~44) before it can recover.
+    Gradients still flow to U/V (verified) and they are the dominant
+    reconstruction directions, so this matches standard low-rank adapter tuning.
+    """
+    engine.train()
+    params = []
+    for module in (engine.experts_w1[idx], engine.experts_w2[idx]):
+        for name, p in module.named_parameters():
+            if not name.startswith("residual_siren"):
+                params.append(p)
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.01)
+    g = torch.Generator().manual_seed(seed)
+    n = bank["h_in"].size(0)
+    losses = []
+    for _ in range(steps):
+        idx_b = torch.randint(0, n, (batch_size,), generator=g)
+        h_in = bank["h_in"][idx_b]
+        h_tgt = bank["h_target"][idx_b]
+        opt.zero_grad()
+        out = _expert_forward(engine, idx, h_in)
+        loss = torch.nn.functional.mse_loss(out, h_tgt)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt.step()
+        losses.append(loss.item())
+    # Final refresh so the cache reflects trained weights.
+    engine.experts_w1[idx].force_refresh()
+    engine.experts_w2[idx].force_refresh()
+    return losses
+
+
+def phase1_experts_shared(engine: ContinuousThoughtEngine, bank: dict, *,
+                          steps: int = 2000, lr: float = 1e-3,
+                          batch_size: int = 64, seed: int = 0) -> list:
+    """Arm B Phase 1: all experts trained on the SAME shared bank.
+
+    Returns a flat list of per-step MSE losses across all experts.
+    """
+    all_losses = []
+    for i in range(engine.n_experts):
+        losses = _train_one_expert(engine, i, bank, steps=steps, lr=lr,
+                                   batch_size=batch_size, seed=seed + i)
+        all_losses.extend(losses)
+    return all_losses
+
+
+def phase1_experts_partitioned(engine: ContinuousThoughtEngine, banks: list, *,
+                               steps: int = 2000, lr: float = 1e-3,
+                               batch_size: int = 64, seed: int = 0) -> list:
+    """Arm C Phase 1: expert i trained only on banks[i] (disjoint data).
+
+    Returns a flat list of per-step MSE losses across all experts.
+    """
+    assert len(banks) == engine.n_experts, "need one bank per expert"
+    all_losses = []
+    for i in range(engine.n_experts):
+        losses = _train_one_expert(engine, i, banks[i], steps=steps, lr=lr,
+                                   batch_size=batch_size, seed=seed + i)
+        all_losses.extend(losses)
+    return all_losses

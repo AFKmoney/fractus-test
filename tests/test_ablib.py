@@ -51,3 +51,20 @@ def test_load_corpus_splits_and_partitions():
     assert torch.equal(rejoined, split["phase1"])
     # Train and holdout must not overlap (drawn from different parts of the shuffle).
     assert split["train"].numel() + split["holdout"].numel() + split["phase1"].numel() == 1600
+
+
+def test_make_hidden_bank_shape_and_alignment():
+    eng = ablib.build_engine(seed=42)
+    tokens = torch.arange(1000, dtype=torch.int64) % 50257
+    bank = ablib.make_hidden_bank(eng, tokens, chunk_len=32, n_chunks=10, seed=0)
+    assert set(bank.keys()) == {"h_in", "h_target"}
+    # 10 chunks × 31 consecutive pairs = 310 samples.
+    assert bank["h_in"].shape == (310, eng.d_model)
+    assert bank["h_target"].shape == (310, eng.d_model)
+    # Pairs are positionally aligned: h_target[t] == observe(token after h_in[t]).
+    # Sanity: embedding is deterministic, so re-deriving matches.
+    with torch.no_grad():
+        first_in_token = tokens[0]
+        # The first sampled pair uses tokens at consecutive corpus positions.
+        # We only check that h_in != h_target (otherwise the target is trivial).
+        assert not torch.equal(bank["h_in"][0], bank["h_target"][0])

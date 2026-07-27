@@ -47,3 +47,29 @@ def load_corpus(path: str, *, n_train: int = 400_000, n_holdout: int = 30_000,
 
     return {"train": train, "holdout": holdout,
             "phase1": phase1, "domain_split": domain_split}
+
+
+def make_hidden_bank(engine: ContinuousThoughtEngine, tokens: torch.Tensor,
+                     *, chunk_len: int = 32, n_chunks: int = 1000,
+                     seed: int = 0) -> dict:
+    """Build (h_t, h_{t+1}) pairs from engine.observe over consecutive positions.
+
+    For each of n_chunks randomly placed chunks of length chunk_len, emit
+    (chunk_len - 1) aligned pairs. Pairs never cross chunk boundaries.
+    Returns {"h_in": (P, d_model), "h_target": (P, d_model)} where
+    P = n_chunks * (chunk_len - 1).
+    """
+    engine.eval()
+    g = torch.Generator().manual_seed(seed)
+    n = tokens.numel()
+    assert n > chunk_len, "need at least chunk_len tokens"
+    starts = torch.randint(0, n - chunk_len + 1, (n_chunks,), generator=g)
+    h_in_list, h_tgt_list = [], []
+    with torch.no_grad():
+        for s in starts.tolist():
+            chunk = tokens[s:s + chunk_len]              # (chunk_len,) consecutive
+            h = engine.observe(chunk)                     # (chunk_len, d_model)
+            h_in_list.append(h[:-1].clone())              # (chunk_len-1, d_model)
+            h_tgt_list.append(h[1:].clone())              # (chunk_len-1, d_model)
+    return {"h_in": torch.cat(h_in_list, dim=0),
+            "h_target": torch.cat(h_tgt_list, dim=0)}

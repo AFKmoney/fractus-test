@@ -259,3 +259,67 @@ def phase3_joint(engine: ContinuousThoughtEngine, tokens: torch.Tensor, *,
             "avg_loss": total / max(n, 1),
             "accuracy": correct / max(n, 1),
             "steps": n}
+
+
+def evaluate_ppl(engine: ContinuousThoughtEngine, tokens: torch.Tensor,
+                 chunk_len: int = 16, nll_cap: float = 20.0) -> float:
+    """Perplexity on a hold-out stream, computed via tick_chunk (full engine)."""
+    engine.eval()
+    engine.reset_thought(batch_size=1)
+    total_nll, n = 0.0, 0
+    for s in range(0, tokens.numel() - chunk_len - 1, chunk_len):
+        chunk = tokens[s:s + chunk_len].unsqueeze(0)
+        tgt = tokens[s + 1:s + 1 + chunk_len].reshape(-1)
+        with torch.no_grad():
+            logits = engine.tick_chunk(chunk).reshape(-1, engine.vocab_size)
+            nll = torch.nn.functional.cross_entropy(logits, tgt, reduction="none")
+            nll = nll.clamp(max=nll_cap)
+        total_nll += nll.sum().item()
+        n += tgt.numel()
+    avg_nll = total_nll / max(n, 1)
+    import math
+    return math.exp(avg_nll)
+
+
+def expert_diversity(engine: ContinuousThoughtEngine, probe_tokens: torch.Tensor) -> float:
+    """Mean off-diagonal cosine between expert outputs on a fixed shared probe.
+
+    Lower = more diverse (better specialization).
+    """
+    engine.eval()
+    with torch.no_grad():
+        h = engine.observe(probe_tokens)            # (P, d_model)
+        outs = []
+        for i in range(engine.n_experts):
+            outs.append(_expert_forward(engine, i, h))   # (P, d_model)
+        outs = torch.stack(outs)                          # (E, P, d_model)
+    E = outs.size(0)
+    cos_sum, count = 0.0, 0
+    for i in range(E):
+        for j in range(E):
+            if i == j:
+                continue
+            a = outs[i].flatten()
+            b = outs[j].flatten()
+            cos = torch.nn.functional.cosine_similarity(a, b, dim=0).item()
+            cos_sum += cos
+            count += 1
+    return cos_sum / max(count, 1)
+
+
+def greedy_sample(engine: ContinuousThoughtEngine, prompt: torch.Tensor,
+                  n_tokens: int = 80) -> str:
+    """Greedy decode n_tokens after the prompt, detokenize to a string."""
+    from fractus.tokenizer import FractusTokenizer
+    tok = FractusTokenizer.gpt2_compatible()
+    engine.eval()
+    engine.reset_thought(batch_size=1)
+    ids = prompt.tolist()
+    cur = torch.tensor(ids[-1:], dtype=torch.int64)
+    for _ in range(n_tokens):
+        with torch.no_grad():
+            logits, _ = engine.tick(cur)
+        nxt = int(logits.argmax(-1).item())
+        ids.append(nxt)
+        cur = torch.tensor([nxt], dtype=torch.int64)
+    return tok.decode(ids)

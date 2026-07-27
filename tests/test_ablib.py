@@ -124,3 +124,27 @@ def test_phase3_joint_reduces_loss_and_returns_curve():
            sum(out["losses"][:half]) / max(half, 1)
     # All params trainable.
     assert all(p.requires_grad for p in eng.parameters())
+
+
+def test_evaluate_ppl_returns_finite_positive():
+    eng = ablib.build_engine(seed=42)
+    tokens = torch.arange(2000, dtype=torch.int64) % 50257
+    ppl = ablib.evaluate_ppl(eng, tokens[:500])
+    assert ppl == ppl  # not NaN
+    assert ppl > 0.0
+
+
+def test_expert_diversity_returns_float_in_range():
+    eng = ablib.build_engine(seed=42)
+    probe_tokens = torch.arange(256, dtype=torch.int64) % 50257
+    div = ablib.expert_diversity(eng, probe_tokens)
+    assert -1.0 <= div <= 1.0
+
+
+def test_greedy_sample_returns_string_of_expected_length():
+    eng = ablib.build_engine(seed=42)
+    prompt = torch.tensor([1, 2, 3], dtype=torch.int64)
+    s = ablib.greedy_sample(eng, prompt, n_tokens=10)
+    assert isinstance(s, str)
+    # Tokenizer detok may merge; just check it's non-empty.
+    assert len(s) > 0

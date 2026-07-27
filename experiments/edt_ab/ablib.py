@@ -7,6 +7,7 @@ No I/O, no side effects — every function is unit-testable.
 import torch
 
 from fractus.continuous_engine import ContinuousThoughtEngine
+from fractus.train.online import OnlineTrainer
 
 
 def build_engine(seed: int = 42) -> ContinuousThoughtEngine:
@@ -217,3 +218,44 @@ def phase2b_embedding(engine: ContinuousThoughtEngine, tokens: torch.Tensor, *,
     for p in engine.parameters():
         p.requires_grad_(True)
     return losses
+
+
+def phase3_joint(engine: ContinuousThoughtEngine, tokens: torch.Tensor, *,
+                 steps: int, lr: float = 3e-4, chunk_len: int = 16) -> dict:
+    """Phase 3: full-model online training, chunk-based.
+
+    `steps` is the number of optimizer steps (chunks). Each chunk is `chunk_len`
+    tokens. The total tokens consumed is steps * chunk_len.
+    """
+    engine.train()
+    for p in engine.parameters():
+        p.requires_grad_(True)
+    # Force-refresh all expert caches so Phase 3 starts from trained matrices.
+    for i in range(engine.n_experts):
+        engine.experts_w1[i].force_refresh()
+        engine.experts_w2[i].force_refresh()
+    trainer = OnlineTrainer(engine, lr=lr)
+    trainer.losses = []  # fresh curve
+    engine.reset_thought(batch_size=1)
+
+    total, correct, n = 0.0, 0, 0
+    vocab = engine.vocab_size
+    for start in range(0, steps * chunk_len, chunk_len):
+        if start + chunk_len + 1 >= tokens.numel():
+            break
+        chunk = tokens[start:start + chunk_len].unsqueeze(0)
+        tgt = tokens[start + 1:start + 1 + chunk_len].reshape(-1)
+        logits = engine.tick_chunk(chunk).reshape(-1, vocab)
+        loss = torch.nn.functional.cross_entropy(logits, tgt)
+        trainer.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(engine.parameters(), 1.0)
+        trainer.optimizer.step()
+        trainer.losses.append(loss.item())
+        total += loss.item() * chunk_len
+        correct += (logits.argmax(-1) == tgt).sum().item()
+        n += chunk_len
+    return {"losses": trainer.losses,
+            "avg_loss": total / max(n, 1),
+            "accuracy": correct / max(n, 1),
+            "steps": n}

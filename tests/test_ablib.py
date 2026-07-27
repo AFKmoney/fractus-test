@@ -109,3 +109,18 @@ def test_phase2b_reduces_ce_and_only_touches_observe_and_head():
     for n, p in eng.named_parameters():
         if n in frozen_before:
             assert torch.equal(p, frozen_before[n]), f"{n} changed during Phase 2b"
+
+
+def test_phase3_joint_reduces_loss_and_returns_curve():
+    from fractus.train.online import OnlineTrainer
+    eng = ablib.build_engine(seed=42)
+    tokens = torch.arange(4000, dtype=torch.int64) % 50257
+    out = ablib.phase3_joint(eng, tokens, steps=50, lr=1e-3, chunk_len=16)
+    assert "losses" in out and "avg_loss" in out and "accuracy" in out
+    assert len(out["losses"]) > 0
+    # First half vs second half: loss should trend down.
+    half = len(out["losses"]) // 2
+    assert sum(out["losses"][half:]) / max(len(out["losses"]) - half, 1) < \
+           sum(out["losses"][:half]) / max(half, 1)
+    # All params trainable.
+    assert all(p.requires_grad for p in eng.parameters())

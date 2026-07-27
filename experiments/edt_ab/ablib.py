@@ -161,3 +161,59 @@ def phase1_experts_partitioned(engine: ContinuousThoughtEngine, banks: list, *,
                                    batch_size=batch_size, seed=seed + i)
         all_losses.extend(losses)
     return all_losses
+
+
+def _eval_ce(engine: ContinuousThoughtEngine, tokens: torch.Tensor,
+             chunk_len: int = 16) -> float:
+    """Mean per-token cross-entropy of the two-table LM (observe→output_head)."""
+    engine.eval()
+    total, n = 0.0, 0
+    with torch.no_grad():
+        for s in range(0, tokens.numel() - chunk_len - 1, chunk_len):
+            chunk = tokens[s:s + chunk_len].unsqueeze(0)
+            tgt = tokens[s + 1:s + 1 + chunk_len].reshape(-1)
+            h = engine.observe(chunk)
+            logits = engine.output_head(h).reshape(-1, engine.vocab_size)
+            total += torch.nn.functional.cross_entropy(
+                logits, tgt, reduction="sum").item()
+            n += tgt.numel()
+    return total / max(n, 1)
+
+
+def phase2b_embedding(engine: ContinuousThoughtEngine, tokens: torch.Tensor, *,
+                      steps: int = 2000, lr: float = 1e-3,
+                      chunk_len: int = 16, seed: int = 0) -> list:
+    """Phase 2b: train observe + output_head only (everything else frozen)."""
+    engine.train()
+    # Freeze everything, then unfreeze the two tables.
+    for p in engine.parameters():
+        p.requires_grad_(False)
+    for p in engine.observe.parameters():
+        p.requires_grad_(True)
+    for p in engine.output_head.parameters():
+        p.requires_grad_(True)
+
+    opt = torch.optim.AdamW(
+        list(engine.observe.parameters()) + list(engine.output_head.parameters()),
+        lr=lr, weight_decay=0.01)
+    g = torch.Generator().manual_seed(seed)
+    n = tokens.numel()
+    losses = []
+    for _ in range(steps):
+        s = torch.randint(0, n - chunk_len - 1, (1,), generator=g).item()
+        chunk = tokens[s:s + chunk_len].unsqueeze(0)
+        tgt = tokens[s + 1:s + 1 + chunk_len].reshape(-1)
+        opt.zero_grad()
+        h = engine.observe(chunk)
+        logits = engine.output_head(h).reshape(-1, engine.vocab_size)
+        loss = torch.nn.functional.cross_entropy(logits, tgt)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            list(engine.observe.parameters()) + list(engine.output_head.parameters()),
+            1.0)
+        opt.step()
+        losses.append(loss.item())
+    # Restore: everything trainable again (Phase 3 expects this).
+    for p in engine.parameters():
+        p.requires_grad_(True)
+    return losses

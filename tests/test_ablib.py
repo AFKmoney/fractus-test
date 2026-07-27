@@ -91,3 +91,21 @@ def test_phase1_partitioned_trains_each_expert_on_own_bank():
     mse_after = [ablib._eval_expert_mse(eng, i, banks[i]) for i in range(4)]
     for i in range(4):
         assert mse_after[i] < mse_before[i], f"expert {i} did not improve"
+
+
+def test_phase2b_reduces_ce_and_only_touches_observe_and_head():
+    eng = ablib.build_engine(seed=42)
+    # Snapshot the frozen params (attn + moe norms + experts) to prove they don't change.
+    frozen_names = [n for n, _ in eng.named_parameters()
+                    if not (n.startswith("observe.") or n.startswith("output_head."))]
+    frozen_before = {n: p.detach().clone() for n, p in eng.named_parameters()
+                     if n in frozen_names}
+    tokens = torch.arange(3000, dtype=torch.int64) % 50257
+    ce_before = ablib._eval_ce(eng, tokens[:1000])
+    ablib.phase2b_embedding(eng, tokens, steps=30, lr=1e-2, seed=0)
+    ce_after = ablib._eval_ce(eng, tokens[:1000])
+    assert ce_after < ce_before
+    # Frozen params untouched.
+    for n, p in eng.named_parameters():
+        if n in frozen_before:
+            assert torch.equal(p, frozen_before[n]), f"{n} changed during Phase 2b"

@@ -323,3 +323,73 @@ def greedy_sample(engine: ContinuousThoughtEngine, prompt: torch.Tensor,
         ids.append(nxt)
         cur = torch.tensor([nxt], dtype=torch.int64)
     return tok.decode(ids)
+
+
+# ---- Arm orchestrators (A / B / C) ----
+
+# ---- phase token accounting (spec §5) ----
+PHASE1_FRAC, PHASE2B_FRAC, PHASE3_FRAC = 0.15, 0.30, 0.55
+
+PROMPT = torch.tensor([464, 1292, 13], dtype=torch.int64)  # "The dog." in GPT-2 BPE
+
+
+def _probe(holdout: torch.Tensor, n: int = 256) -> torch.Tensor:
+    return holdout[:n].to(torch.int64)
+
+
+def _finalize(engine, holdout, losses) -> dict:
+    return {
+        "ppl": evaluate_ppl(engine, holdout),
+        "accuracy": None,  # filled by phase3 wrapper if available
+        "diversity": expert_diversity(engine, _probe(holdout)),
+        "losses": losses,
+        "sample": greedy_sample(engine, PROMPT, n_tokens=80),
+    }
+
+
+def arm_from_scratch(engine, *, train, holdout, budget, chunk_len=16,
+                     lr=3e-4) -> dict:
+    """Arm A: online training on the full budget, no pre-training."""
+    p3 = phase3_joint(engine, train[:budget], steps=budget // chunk_len,
+                      lr=lr, chunk_len=chunk_len)
+    out = _finalize(engine, holdout, p3["losses"])
+    out["accuracy"] = p3["accuracy"]
+    return out
+
+
+def arm_edt_vanilla(engine, *, train, holdout, budget, chunk_len=16,
+                    lr=3e-4) -> dict:
+    """Arm B: EDT faithful to docs/EDT.md (shared bank)."""
+    n1 = int(budget * PHASE1_FRAC)
+    n2b = int(budget * PHASE2B_FRAC)
+    n3 = budget - n1 - n2b
+    bank = make_hidden_bank(engine, train[:n1], chunk_len=chunk_len,
+                            n_chunks=max(n1 // chunk_len, 1), seed=0)
+    p1 = phase1_experts_shared(engine, bank, steps=2000, lr=1e-3, seed=0)
+    p2b = phase2b_embedding(engine, train[:n2b], steps=n2b // chunk_len,
+                            lr=1e-3, chunk_len=chunk_len, seed=0)
+    p3 = phase3_joint(engine, train[:n3], steps=n3 // chunk_len,
+                      lr=lr, chunk_len=chunk_len)
+    out = _finalize(engine, holdout, p3["losses"])
+    out.update({"phase1_losses": p1, "phase2b_losses": p2b,
+                "phase3_losses": p3["losses"], "accuracy": p3["accuracy"]})
+    return out
+
+
+def arm_edt_spec(engine, *, train, holdout, budget, domain_split, chunk_len=16,
+                 lr=3e-4) -> dict:
+    """Arm C: EDT with per-expert disjoint domain banks."""
+    n2b = int(budget * PHASE2B_FRAC)
+    n3 = budget - int(budget * PHASE1_FRAC) - n2b
+    banks = [make_hidden_bank(engine, ds, chunk_len=chunk_len,
+                              n_chunks=max(ds.numel() // chunk_len, 1), seed=i)
+             for i, ds in enumerate(domain_split)]
+    p1 = phase1_experts_partitioned(engine, banks, steps=2000, lr=1e-3, seed=0)
+    p2b = phase2b_embedding(engine, train[:n2b], steps=n2b // chunk_len,
+                            lr=1e-3, chunk_len=chunk_len, seed=0)
+    p3 = phase3_joint(engine, train[:n3], steps=n3 // chunk_len,
+                      lr=lr, chunk_len=chunk_len)
+    out = _finalize(engine, holdout, p3["losses"])
+    out.update({"phase1_losses": p1, "phase2b_losses": p2b,
+                "phase3_losses": p3["losses"], "accuracy": p3["accuracy"]})
+    return out

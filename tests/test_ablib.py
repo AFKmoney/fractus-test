@@ -148,3 +148,35 @@ def test_greedy_sample_returns_string_of_expected_length():
     assert isinstance(s, str)
     # Tokenizer detok may merge; just check it's non-empty.
     assert len(s) > 0
+
+
+def test_arm_from_scratch_runs_and_reports_ppl():
+    eng = ablib.build_engine(seed=42)
+    tokens = torch.arange(4000, dtype=torch.int64) % 50257
+    out = ablib.arm_from_scratch(eng, train=tokens, holdout=tokens[3000:3500],
+                                 budget=1000, chunk_len=16, lr=1e-3)
+    for k in ("ppl", "accuracy", "diversity", "losses", "sample"):
+        assert k in out
+
+
+def test_arm_edt_vanilla_runs_and_reports_phase_losses():
+    eng = ablib.build_engine(seed=42)
+    tokens = torch.arange(8000, dtype=torch.int64) % 50257
+    out = ablib.arm_edt_vanilla(eng, train=tokens, holdout=tokens[7000:7500],
+                                budget=2000, chunk_len=16, lr=1e-3)
+    for k in ("ppl", "phase1_losses", "phase2b_losses", "phase3_losses",
+              "diversity", "sample"):
+        assert k in out
+
+
+def test_arm_edt_spec_uses_domain_split():
+    eng = ablib.build_engine(seed=42)
+    base = torch.arange(8000, dtype=torch.int64) % 50257
+    phase1 = base[:1000]
+    domain_split = [phase1[i * 250:(i + 1) * 250] for i in range(4)]
+    out = ablib.arm_edt_spec(eng, train=base[1000:], holdout=base[7000:7500],
+                             budget=2000, domain_split=domain_split,
+                             chunk_len=16, lr=1e-3)
+    for k in ("ppl", "phase1_losses", "phase2b_losses", "phase3_losses",
+              "diversity", "sample"):
+        assert k in out

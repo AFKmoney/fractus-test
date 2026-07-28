@@ -135,3 +135,53 @@ def test_moe_dense_path_still_correct():
     out, lb = moe(h, phases)
     assert out.shape == (2, 5, D)
     assert torch.isfinite(out).all() and torch.isfinite(lb)
+
+
+def test_moe_lowrank_output_shape():
+    """Low-rank mode: same output shape as dense."""
+    from fractus.nn.moe import PhaseRoutedMoE
+    moe = PhaseRoutedMoE(d_model=16, n_experts=4, top_k=2, kappa=4.0, d_ff=32, expert_rank=8)
+    h = torch.randn(2, 8, 16)
+    phases = torch.rand(2, 8, 4) * 2 * math.pi
+    out, lb_loss = moe(h, phases)
+    assert out.shape == (2, 8, 16)
+    assert lb_loss.dim() == 0
+
+
+def test_moe_lowrank_backward_every_param():
+    """Low-rank mode: gradient reaches U1, V1, U2, V2, scale1, scale2, b1, b2."""
+    from fractus.nn.moe import PhaseRoutedMoE
+    moe = PhaseRoutedMoE(d_model=16, n_experts=4, top_k=2, kappa=4.0, d_ff=32, expert_rank=8)
+    h = torch.randn(2, 8, 16)
+    phases = torch.rand(2, 8, 4) * 2 * math.pi
+    out, lb_loss = moe(h, phases)
+    loss = out.pow(2).mean() + 0.1 * lb_loss
+    loss.backward()
+    for name, p in moe.named_parameters():
+        assert p.requires_grad, f"{name} should requires_grad=True"
+        assert p.grad is not None, f"{name} received no gradient"
+        assert torch.isfinite(p.grad).all(), f"{name} has non-finite grad"
+        assert p.grad.abs().sum().item() > 0, f"{name} received zero gradient"
+
+
+def test_moe_lowrank_has_expected_params():
+    """Low-rank mode exposes U1/V1/U2/V2/scale factors, not w1/w2."""
+    from fractus.nn.moe import PhaseRoutedMoE
+    moe = PhaseRoutedMoE(d_model=16, n_experts=4, top_k=2, d_ff=32, expert_rank=8)
+    names = {n for n, _ in moe.named_parameters()}
+    assert "U1" in names and "V1" in names and "U2" in names and "V2" in names
+    assert "scale1" in names and "scale2" in names
+    assert "w1" not in names and "w2" not in names
+    assert moe.U1.shape == (4, 32, 8)
+    assert moe.V1.shape == (4, 16, 8)
+    assert moe.U2.shape == (4, 16, 8)
+    assert moe.V2.shape == (4, 32, 8)
+
+
+def test_moe_dense_still_has_dense_params():
+    """Dense mode (expert_rank=None) unchanged: w1/w2 present, no U/V."""
+    from fractus.nn.moe import PhaseRoutedMoE
+    moe = PhaseRoutedMoE(d_model=16, n_experts=4, top_k=2, d_ff=32)  # no expert_rank
+    names = {n for n, _ in moe.named_parameters()}
+    assert "w1" in names and "w2" in names
+    assert "U1" not in names

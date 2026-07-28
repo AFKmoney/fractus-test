@@ -41,6 +41,13 @@ class PhaseRoutedMoE(nn.Module):
         kappa       : von Mises concentration.
         temperature : gate temperature (κ_eff = κ/temperature).
         d_ff        : expert hidden dimension (64 by default, as in the original).
+        expert_rank : if None, dense experts (W1 (E,D,F), W2 (E,F,D)). If r,
+                      low-rank (LoRA-style) experts: W1 ≈ scale1·U1@V1ᵀ,
+                      W2 ≈ scale2·U2@V2ᵀ with factors U1 (E,F,r), V1 (E,D,r),
+                      U2 (E,D,r), V2 (E,F,r). The low-rank form keeps the
+                      Fractus compression story (LazyStructuredSirenLinear
+                      already established this for the 1B) and lets one
+                      component serve the 13M and the 1B. Routing is unchanged.
     """
 
     def __init__(
@@ -51,30 +58,53 @@ class PhaseRoutedMoE(nn.Module):
         kappa: float = 4.0,
         temperature: float = 1.0,
         d_ff: int = 64,
+        expert_rank: int | None = None,
     ):
         super().__init__()
         if n_experts < 1:
             raise ValueError("n_experts >= 1")
         if top_k < 1 or top_k > n_experts:
             raise ValueError(f"top_k must be in [1, {n_experts}], got {top_k}")
+        if expert_rank is not None and expert_rank < 1:
+            raise ValueError("expert_rank must be >= 1 (or None for dense)")
         self.d_model = d_model
         self.n_experts = n_experts
         self.top_k = top_k
         self.kappa = kappa
         self.temperature = temperature
         self.d_ff = d_ff
+        self.expert_rank = expert_rank
 
         # Expert phases (Farey precomputation, off-graph).
         phases = expert_phases(n_experts)
         self.register_buffer("expert_phases", torch.tensor(phases, dtype=torch.float32))
 
-        # Expert weights: E × (W1, b1, W2, b2). Xavier uniform init.
-        scale1 = math.sqrt(2.0 / d_model)
-        scale2 = math.sqrt(2.0 / d_ff)
-        self.w1 = nn.Parameter(torch.empty(n_experts, d_model, d_ff).uniform_(-scale1, scale1))
-        self.b1 = nn.Parameter(torch.zeros(n_experts, d_ff))
-        self.w2 = nn.Parameter(torch.empty(n_experts, d_ff, d_model).uniform_(-scale2, scale2))
-        self.b2 = nn.Parameter(torch.zeros(n_experts, d_model))
+        if expert_rank is None:
+            # Dense experts: W1 (E,D,F), W2 (E,F,D). Xavier uniform init.
+            scale1 = math.sqrt(2.0 / d_model)
+            scale2 = math.sqrt(2.0 / d_ff)
+            self.w1 = nn.Parameter(torch.empty(n_experts, d_model, d_ff).uniform_(-scale1, scale1))
+            self.b1 = nn.Parameter(torch.zeros(n_experts, d_ff))
+            self.w2 = nn.Parameter(torch.empty(n_experts, d_ff, d_model).uniform_(-scale2, scale2))
+            self.b2 = nn.Parameter(torch.zeros(n_experts, d_model))
+        else:
+            # Low-rank (LoRA-style) experts: W1 ≈ scale1·U1@V1ᵀ, W2 ≈ scale2·U2@V2ᵀ.
+            # U1 (E, F, r), V1 (E, D, r); U2 (E, D, r), V2 (E, F, r).
+            # Forward runs via two cheap matmuls (no full matrix materialized),
+            # matching the LazyStructuredSirenLinear pattern used to fix the 1B.
+            r = expert_rank
+            su1 = math.sqrt(2.0 / (d_ff + r))
+            sv1 = math.sqrt(2.0 / (d_model + r))
+            su2 = math.sqrt(2.0 / (d_model + r))
+            sv2 = math.sqrt(2.0 / (d_ff + r))
+            self.U1 = nn.Parameter(torch.empty(n_experts, d_ff, r).uniform_(-su1, su1))
+            self.V1 = nn.Parameter(torch.empty(n_experts, d_model, r).uniform_(-sv1, sv1))
+            self.U2 = nn.Parameter(torch.empty(n_experts, d_model, r).uniform_(-su2, su2))
+            self.V2 = nn.Parameter(torch.empty(n_experts, d_ff, r).uniform_(-sv2, sv2))
+            self.scale1 = nn.Parameter(torch.ones(n_experts, 1, 1))
+            self.scale2 = nn.Parameter(torch.ones(n_experts, 1, 1))
+            self.b1 = nn.Parameter(torch.zeros(n_experts, d_ff))
+            self.b2 = nn.Parameter(torch.zeros(n_experts, d_model))
 
     def _compute_gates(self, phases: torch.Tensor) -> torch.Tensor:
         """Computes the von Mises gates for each token.
@@ -138,11 +168,31 @@ class PhaseRoutedMoE(nn.Module):
         h: (B, L, d_model) → outputs of all experts (B, L, E, d_model).
         Cheaper than sparse on CPU when E is small (einsum is more optimized
         than per-token index_select + broadcast). Used when n_experts is small.
+
+        In low-rank mode the expert forward is computed via two cheap matmuls
+        per expert (no full weight matrix materialized), matching the LoRA
+        pattern in LazyStructuredSirenLinear: W1 ≈ scale1·U1@V1ᵀ,
+        W2 ≈ scale2·U2@V2ᵀ.
         """
         B, L, D = h.shape
-        h1 = torch.einsum("bld,edf->blef", h, self.w1) + self.b1.view(1, 1, self.n_experts, self.d_ff)
+        if self.expert_rank is None:
+            h1 = torch.einsum("bld,edf->blef", h, self.w1) + self.b1.view(1, 1, self.n_experts, self.d_ff)
+            h1_act = _gelu(h1)
+            out = torch.einsum("blef,efd->bled", h1_act, self.w2) + self.b2.view(1, 1, self.n_experts, self.d_model)
+            return out
+        # Low-rank layer 1: h1 = scale1 · (h @ V1) @ U1ᵀ + b1.
+        #   h: (B,L,D); V1: (E,D,r) → hV1: (B,L,E,r); U1: (E,F,r) →
+        #   contracting r: h1[b,l,e,f] = Σ_r hV1[b,l,e,r]·U1[e,f,r] = (h@V1)·U1ᵀ.
+        #   scale1 is stored (E,1,1) (spec D1); reshape to (1,1,E,1) so it
+        #   broadcasts over the E dim of (B,L,E,F) — mirroring the b1 reshape.
+        hV1 = torch.einsum("bld,edr->bler", h, self.V1)            # (B,L,E,r)
+        h1 = self.scale1.view(1, 1, self.n_experts, 1) * torch.einsum("bler,efr->blef", hV1, self.U1) + self.b1.view(1, 1, self.n_experts, self.d_ff)
         h1_act = _gelu(h1)
-        out = torch.einsum("blef,efd->bled", h1_act, self.w2) + self.b2.view(1, 1, self.n_experts, self.d_model)
+        # Low-rank layer 2: out = scale2 · (h1_act @ V2) @ U2ᵀ + b2.
+        #   h1_act: (B,L,E,F); V2: (E,F,r) → hV2: (B,L,E,r); U2: (E,D,r) →
+        #   contracting r: out[b,l,e,d] = Σ_r hV2[b,l,e,r]·U2[e,d,r] = (h1@V2)·U2ᵀ.
+        hV2 = torch.einsum("blef,efr->bler", h1_act, self.V2)      # (B,L,E,r)
+        out = self.scale2.view(1, 1, self.n_experts, 1) * torch.einsum("bler,edr->bled", hV2, self.U2) + self.b2.view(1, 1, self.n_experts, self.d_model)
         return out
 
     def forward(
@@ -157,6 +207,11 @@ class PhaseRoutedMoE(nn.Module):
               beats per-token index_select for small E.
         Measured: for E=4,K=2 the dense path is ~1.5× faster than sparse; for
         E=32,K=8 the sparse path wins. The 2× threshold is the empirical knee.
+
+        Low-rank mode (expert_rank is not None) is dense-only in this
+        iteration (spec D2): if a config would have selected sparse, it falls
+        back to dense with a one-time warning. The 13M AB test uses dense
+        (E=4 <= 2·K=4), so this covers it.
         """
         gates = self._compute_gates(phases)  # (B, L, E)
 
@@ -168,7 +223,21 @@ class PhaseRoutedMoE(nn.Module):
         )
 
         # Adaptive: dense when small E (einsum wins on CPU), sparse when large E.
-        if self.n_experts > 2 * self.top_k:
+        # Low-rank mode is dense-only in this iteration (spec D2): the
+        # gather-first sparse dispatch is not wired through the LoRA factors.
+        # If the config would have selected sparse, fall back to dense and warn
+        # once. (The 13M AB test uses E=4 <= 2·K=4, so it always hits dense.)
+        if self.expert_rank is not None and self.n_experts > 2 * self.top_k:
+            import warnings
+            warnings.warn(
+                "PhaseRoutedMoE: low-rank sparse dispatch not implemented; "
+                "falling back to dense forward.",
+                stacklevel=2,
+            )
+            use_sparse = False
+        else:
+            use_sparse = self.n_experts > 2 * self.top_k
+        if use_sparse:
             topk_out = self._sparse_expert_forward(h, topk_idx)  # (B, L, K, d_model)
         else:
             all_out = self._dense_expert_forward(h)  # (B, L, E, d_model)

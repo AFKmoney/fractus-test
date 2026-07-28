@@ -41,8 +41,7 @@ import torch.nn.functional as F
 from .nn.attention import FractalLinearAttention
 from .nn.phase_ode import KuramotoLayer
 from .nn.stats import elu_plus_one
-from .nn.farey import expert_phases
-from .nn.cached_siren import CachedStructuredSirenLinear
+from .nn.moe import PhaseRoutedMoE
 
 
 class ContinuousThoughtEngine(nn.Module):
@@ -91,25 +90,20 @@ class ContinuousThoughtEngine(nn.Module):
                                       n_steps=1, dt=0.1)  # 1 step per tick (fast)
         self.norm_kur = nn.LayerNorm(d_model)
 
-        # 3. MoE (transforms the thought, routed by Kuramoto phases)
+        # 3. MoE (transforms the thought, routed by Kuramoto phases).
+        #    Uses the documented PhaseRoutedMoE (L2b): von Mises gate on Farey
+        #    phases, top-k, load-balance loss, end-to-end differentiable.
+        #    Low-rank experts (LoRA-style) when siren_rank > 0, dense otherwise.
         self.n_experts = n_experts
         self.top_k = top_k
         self.expert_d_ff = expert_d_ff
-        phases = expert_phases(n_experts)
-        self.register_buffer("expert_phases", torch.tensor(phases, dtype=torch.float32))
-        self.kappa = 4.0
-
-        self.experts_w1 = nn.ModuleList([
-            CachedStructuredSirenLinear(d_model, expert_d_ff, rank=siren_rank,
-                                        siren_hidden=32, refresh_every=8)
-            for _ in range(n_experts)
-        ])
-        self.experts_w2 = nn.ModuleList([
-            CachedStructuredSirenLinear(expert_d_ff, d_model, rank=siren_rank,
-                                        siren_hidden=32, refresh_every=8)
-            for _ in range(n_experts)
-        ])
+        self.moe = PhaseRoutedMoE(
+            d_model=d_model, n_experts=n_experts, top_k=top_k,
+            kappa=4.0, d_ff=expert_d_ff,
+            expert_rank=(siren_rank if siren_rank else None),
+        )
         self.norm_moe = nn.LayerNorm(d_model)
+        self.register_buffer("last_lb_loss", torch.tensor(0.0))
 
         # 4. Confidence head: "how sure am I about the current thought?"
         self.confidence_head = nn.Linear(d_model, 1)
@@ -203,32 +197,13 @@ class ContinuousThoughtEngine(nn.Module):
         theta = torch.remainder(theta, self.kuramoto.TWO_PI)
         self.kuramoto_phases = theta.detach()
 
-        # 3. MoE: transform the thought, routed by phases.
-        h_flat = h[:, 0, :]  # (B, d_model) — squeeze the L=1 dim
-        h_moe = self.norm_moe(h_flat)  # (B, d_model)
-        # Compute gates from Kuramoto phases (squeeze L dim).
-        theta_flat = theta[:, 0, :]  # (B, N_osc)
-        sin_p = torch.sin(theta_flat).sum(dim=-1)
-        cos_p = torch.cos(theta_flat).sum(dim=-1)
-        theta_bar = torch.atan2(sin_p, cos_p)  # (B,)
-        diff = theta_bar.unsqueeze(-1) - self.expert_phases.view(1, self.n_experts)
-        gates = torch.softmax(self.kappa * torch.cos(diff), dim=-1)  # (B, E)
-        topk_vals, topk_idx = gates.topk(self.top_k, dim=-1)  # (B, K)
-        topk_norm = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp(min=1e-10)
-
-        moe_out = torch.zeros_like(h_moe)
-        w1_stack = torch.stack([e._cached_W for e in self.experts_w1])  # (E, d_ff, D)
-        w2_stack = torch.stack([e._cached_W for e in self.experts_w2])  # (E, D, d_ff)
-        for k_slot in range(self.top_k):
-            idx_k = topk_idx[:, k_slot]  # (B,)
-            w_k = topk_norm[:, k_slot]  # (B,)
-            w1_sel = w1_stack[idx_k]  # (B, d_ff, D) → transpose for matmul
-            w2_sel = w2_stack[idx_k]  # (B, D, d_ff) → transpose for matmul
-            h1 = torch.bmm(h_moe.unsqueeze(1), w1_sel.transpose(1,2)).squeeze(1)  # (B, d_ff)
-            h1_act = F.gelu(h1)
-            out_k = torch.bmm(h1_act.unsqueeze(1), w2_sel.transpose(1,2)).squeeze(1)  # (B, D)
-            moe_out += w_k.unsqueeze(-1) * out_k
-        h = h + moe_out.unsqueeze(1)  # add back the L dim
+        # 3. MoE: transform the thought, routed by Kuramoto phases.
+        h_flat = h[:, 0, :]                              # (B, d_model)
+        h_moe = self.norm_moe(h_flat).unsqueeze(1)       # (B, 1, d_model)
+        phases_in = theta[:, 0:1, :]                     # (B, 1, n_oscillators)
+        moe_out, lb_loss = self.moe(h_moe, phases_in)    # moe_out: (B, 1, d_model)
+        self.last_lb_loss = lb_loss.detach()
+        h = h + moe_out
 
         # 4. Update thought state.
         self.thought_state = h.detach()
@@ -298,34 +273,15 @@ class ContinuousThoughtEngine(nn.Module):
         h_kur = self.norm_kur(h)
         theta = self.kuramoto._encode_from_hidden(h_kur)
         theta = self.kuramoto._rk4_integrate(theta)
-        theta_flat = theta[:, -1, :]  # (B, N_osc) — use last position's phases
         self.kuramoto_phases = theta.detach()
 
-        # 3. MoE: transform the chunk (vectorized, cached weights).
-        h_moe = self.norm_moe(h)  # (B, C, D)
-        # Use the last-position phases for routing the whole chunk.
-        theta_bar = torch.atan2(
-            torch.sin(theta_flat).sum(-1), torch.cos(theta_flat).sum(-1)
-        )  # (B,)
-        diff = theta_bar.unsqueeze(-1) - self.expert_phases.view(1, self.n_experts)
-        gates = torch.softmax(self.kappa * torch.cos(diff), dim=-1)  # (B, E)
-        topk_vals, topk_idx = gates.topk(self.top_k, dim=-1)
-        topk_norm = topk_vals / topk_vals.sum(-1, keepdim=True).clamp(min=1e-10)
-
-        w1_stack = torch.stack([e._cached_W for e in self.experts_w1])  # (E, d_ff, D)
-        w2_stack = torch.stack([e._cached_W for e in self.experts_w2])  # (E, D, d_ff)
-        moe_out = torch.zeros_like(h_moe)
-        for k_slot in range(self.top_k):
-            idx_k = topk_idx[:, k_slot]  # (B,)
-            w_k = topk_norm[:, k_slot]  # (B,)
-            # Gather weights for each batch element, apply to all C positions.
-            for b in range(B):
-                w1 = w1_stack[idx_k[b]]  # (d_ff, D) → transpose for matmul
-                w2 = w2_stack[idx_k[b]]  # (D, d_ff) → transpose for matmul
-                h1 = h_moe[b] @ w1.T  # (C, D) @ (D, d_ff) → (C, d_ff)
-                h1_act = F.gelu(h1)
-                out_k = h1_act @ w2.T  # (C, d_ff) @ (d_ff, D) → (C, D)
-                moe_out[b] += w_k[b] * out_k
+        # 3. MoE: transform the chunk, routed by the last-position Kuramoto phase.
+        h_moe = self.norm_moe(h)                         # (B, C, d_model)
+        # Use the last position's phase to route the whole chunk (as the original did).
+        phases_last = theta[:, -1:, :]                   # (B, 1, n_oscillators)
+        phases_in = phases_last.expand(-1, h_moe.shape[1], -1)  # (B, C, n_oscillators)
+        moe_out, lb_loss = self.moe(h_moe, phases_in)    # (B, C, d_model)
+        self.last_lb_loss = lb_loss.detach()
         h = h + moe_out
 
         # 4. Update thought state (last position).

@@ -78,12 +78,26 @@ def make_hidden_bank(engine: ContinuousThoughtEngine, tokens: torch.Tensor,
 
 def _expert_forward(engine: ContinuousThoughtEngine, idx: int,
                     h: torch.Tensor) -> torch.Tensor:
-    """expert_w2(gelu(expert_w1(h))). Forces a cache refresh first."""
-    engine.experts_w1[idx].force_refresh()
-    engine.experts_w2[idx].force_refresh()
-    h1 = engine.experts_w1[idx](h)
+    """expert_w2(gelu(expert_w1(h))) for a SINGLE expert idx, reading engine.moe.
+
+    Branches on moe.expert_rank: low-rank (LoRA factors U1/V1/U2/V2/scale1/scale2)
+    or dense (w1/w2). All expert weights are now SHARED (E, ...)-shaped
+    nn.Parameters on engine.moe (Task 2 redesign); we slice row idx to recover
+    expert idx's slice. No cache to refresh — PhaseRoutedMoE stores raw params.
+    """
+    moe = engine.moe
+    if moe.expert_rank is None:
+        # Dense: w1 (E,D,F), w2 (E,F,D), b1 (E,F), b2 (E,D).
+        h1 = h @ moe.w1[idx] + moe.b1[idx]
+        h1_act = torch.nn.functional.gelu(h1)
+        return h1_act @ moe.w2[idx] + moe.b2[idx]
+    # Low-rank: h1 = scale1·((h@V1)@U1ᵀ) + b1; out = scale2·((h1@V2)@U2ᵀ) + b2.
+    #   V1[idx] (D,r), U1[idx] (F,r) → (h@V1[idx]) (batch,r) @ U1[idx].T (r,F) = (batch,F).
+    #   scale1[idx] is (1,1) and broadcasts over (batch,F).
+    h1 = moe.scale1[idx] * ((h @ moe.V1[idx]) @ moe.U1[idx].T) + moe.b1[idx]
     h1_act = torch.nn.functional.gelu(h1)
-    return engine.experts_w2[idx](h1_act)
+    out = moe.scale2[idx] * ((h1_act @ moe.V2[idx]) @ moe.U2[idx].T) + moe.b2[idx]
+    return out
 
 
 def _eval_expert_mse(engine: ContinuousThoughtEngine, idx: int, bank: dict) -> float:
@@ -98,21 +112,31 @@ def _train_one_expert(engine: ContinuousThoughtEngine, idx: int, bank: dict,
                       steps: int, lr: float, batch_size: int, seed: int) -> list:
     """Train expert idx on bank with MSE. Returns per-step loss list.
 
-    We train only the low-rank adapters (U, V) and the bias of each expert's
-    CachedStructuredSirenLinear. The residual_siren is excluded because its
-    spectral high-frequency nature (omega0=30) makes its gradients pathologically
-    large relative to its tiny init scale; including them under the test's
-    lr=1e-2 blows up the loss on step 1 (1.0 → ~44) before it can recover.
-    Gradients still flow to U/V (verified) and they are the dominant
-    reconstruction directions, so this matches standard low-rank adapter tuning.
+    Task 3 (spec D5): all experts share one (E, ...)-shaped nn.Parameter per
+    weight on engine.moe. A naive optimizer.step() over the shared params would
+    update rows j≠i and contaminate the other experts — destroying the B-vs-C
+    Phase-1 specialization comparison. Fix: after loss.backward(), zero the
+    gradient rows j≠i of every shared param (mask[idx]=1, mask=0 elsewhere),
+    then opt.step(). Only row idx is updated, preserving the per-expert
+    isolation that the old ModuleList of separate CachedStructuredSirenLinear
+    modules gave for free.
+
+    NOTE: weight_decay is set to 0.0 (not the 0.01 used in the old per-expert
+    code). AdamW applies weight decay directly to the parameters independent of
+    the gradient, so any nonzero decay would leak into rows j≠i of the shared
+    (E, ...) LoRA factors (verified: ~1e-5/step contamination). With decay=0 the
+    gradient mask alone gives bit-exact isolation. The decay was a minor
+    regularizer and is sacrificed for the isolation guarantee that the B-vs-C
+    comparison's validity depends on.
     """
     engine.train()
-    params = []
-    for module in (engine.experts_w1[idx], engine.experts_w2[idx]):
-        for name, p in module.named_parameters():
-            if not name.startswith("residual_siren"):
-                params.append(p)
-    opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.01)
+    moe = engine.moe
+    if moe.expert_rank is None:
+        params = [moe.b1, moe.b2, moe.w1, moe.w2]
+    else:
+        params = [moe.b1, moe.b2, moe.U1, moe.V1, moe.U2, moe.V2,
+                  moe.scale1, moe.scale2]
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
     g = torch.Generator().manual_seed(seed)
     n = bank["h_in"].size(0)
     losses = []
@@ -124,12 +148,19 @@ def _train_one_expert(engine: ContinuousThoughtEngine, idx: int, bank: dict,
         out = _expert_forward(engine, idx, h_in)
         loss = torch.nn.functional.mse_loss(out, h_tgt)
         loss.backward()
+        # GRADIENT MASKING (spec D5): keep row idx of each shared grad, zero j≠i.
+        # mask[idx] = 1.0 (keep), everywhere else = 0.0 (zeroed) → only row idx
+        # gets an optimizer update, so expert j is untouched by training expert i.
+        with torch.no_grad():
+            for p in params:
+                if p.grad is None:
+                    continue
+                mask = torch.zeros_like(p.grad)
+                mask[idx] = 1.0
+                p.grad.mul_(mask)
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         losses.append(loss.item())
-    # Final refresh so the cache reflects trained weights.
-    engine.experts_w1[idx].force_refresh()
-    engine.experts_w2[idx].force_refresh()
     return losses
 
 
@@ -230,10 +261,7 @@ def phase3_joint(engine: ContinuousThoughtEngine, tokens: torch.Tensor, *,
     engine.train()
     for p in engine.parameters():
         p.requires_grad_(True)
-    # Force-refresh all expert caches so Phase 3 starts from trained matrices.
-    for i in range(engine.n_experts):
-        engine.experts_w1[i].force_refresh()
-        engine.experts_w2[i].force_refresh()
+    # PhaseRoutedMoE (Task 2 redesign) stores raw params, no cache to refresh.
     trainer = OnlineTrainer(engine, lr=lr)
     trainer.losses = []  # fresh curve
     engine.reset_thought(batch_size=1)

@@ -42,6 +42,8 @@
 
 4. **The 13M is a deliberate test of principle** (spec §8 caveat 1): 4 experts and a single MoE (no 16-layer stack) is a very different regime from Fractus-1B (128 experts × 16 layers). A negative result here does NOT refute EDT-1B. Single seed per arm. Specialization is by-position, not semantic (mono-domain corpus). Phase 2a omitted at this scale (no layer stack); `residual_siren` frozen during Phase 1 for stability, applied identically to B and C.
 
+> **Update (2026-07-28):** Limitation §1 above (frozen-expert Phase 3) has since been **fixed** by refactoring the CTE to route its MoE through the differentiable `PhaseRoutedMoE` (low-rank-capable, spec `docs/superpowers/specs/2026-07-28-cte-phaseRoutedMoE-redesign.md`). The numbers in this report are from the PRE-correction run. A re-run with the corrected engine follows; this report's headline numbers and the A-vs-B verdict will be overwritten then. Limitation §4's `residual_siren` freeze is also obsolete (the new MoE has no residual_siren).
+
 ## Provenance
 
 - All numbers from `experiments/edt_ab/results.json` (the canonical aggregate; gitignored as a generated artifact). Arm C's numbers are corroborated to 15+ significant figures by an independent redundant run (`experiments/edt_ab/run_arm_c.py` → `results_c.json`), confirming bit-identical reproducibility.

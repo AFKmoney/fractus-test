@@ -79,13 +79,14 @@ def make_hidden_bank_1b(model: Fractus1B, tokens: torch.Tensor, *,
     P = n_chunks * chunk_len.
     """
     model.eval()
+    device = next(model.parameters()).device
     g = torch.Generator().manual_seed(seed)
     n = tokens.numel()
     assert n > chunk_len + 1
     starts = torch.randint(0, n - chunk_len - 1, (n_chunks,), generator=g)
     h_in_list, h_tgt_list = [], []
     for s in starts.tolist():
-        chunk_ids = tokens[s:s + chunk_len + 1].unsqueeze(0)  # (1, chunk_len+1)
+        chunk_ids = tokens[s:s + chunk_len + 1].unsqueeze(0).to(device)  # (1, chunk_len+1)
         h = _partial_forward_to_block_input(model, chunk_ids, after_block)  # (1, L, D)
         h = h.squeeze(0)  # (L, D)
         h_in_list.append(h[:-1].clone())
@@ -134,6 +135,7 @@ def _train_one_expert_1b(model: Fractus1B, block_idx: int, expert_idx: int,
     No gradient masking needed (unlike the 13M redesign).
     """
     model.train()
+    device = next(model.parameters()).device
     moe = model.blocks[block_idx].moe
     params = list(moe.experts_w1[expert_idx].parameters()) + \
              list(moe.experts_w2[expert_idx].parameters())
@@ -143,8 +145,8 @@ def _train_one_expert_1b(model: Fractus1B, block_idx: int, expert_idx: int,
     losses = []
     for _ in range(steps):
         idx_b = torch.randint(0, n, (batch_size,), generator=g)
-        h_in = bank["h_in"][idx_b]
-        h_tgt = bank["h_target"][idx_b]
+        h_in = bank["h_in"][idx_b].to(device)
+        h_tgt = bank["h_target"][idx_b].to(device)
         opt.zero_grad()
         out = _expert_forward_1b(model, block_idx, expert_idx, h_in)
         loss = torch.nn.functional.mse_loss(out, h_tgt)
@@ -216,6 +218,7 @@ def phase2a_attention_1b(model: Fractus1B, *, n_steps_per_layer: int = 5000,
     would be huge for 16 layers × 5000 steps).
     """
     model.train()
+    device = next(model.parameters()).device
     g = torch.Generator().manual_seed(seed)
     d = model.d_model
     first_block_losses = []
@@ -225,7 +228,7 @@ def phase2a_attention_1b(model: Fractus1B, *, n_steps_per_layer: int = 5000,
         params = list(attn.parameters()) + list(norm.parameters())
         opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
         for step in range(n_steps_per_layer):
-            h = torch.randn(batch_size, seq_len, d, generator=g)
+            h = torch.randn(batch_size, seq_len, d, generator=g, device=device)
             target = h + 0.1 * torch.randn_like(h)
             opt.zero_grad()
             h_normed = norm(h)
@@ -281,13 +284,14 @@ def phase2b_embedding_1b(model: Fractus1B, tokens: torch.Tensor, *,
         p.requires_grad_(True)  # lm_head.weight IS this tensor (tied).
 
     opt = torch.optim.AdamW(model.embed.tok_embed.parameters(), lr=lr, weight_decay=0.0)
+    device = next(model.parameters()).device
     g = torch.Generator().manual_seed(seed)
     n = tokens.numel()
     losses = []
     for _ in range(steps):
         s = torch.randint(0, n - seq_len - 1, (1,), generator=g).item()
-        chunk = tokens[s:s + seq_len].unsqueeze(0)
-        tgt = tokens[s + 1:s + 1 + seq_len].reshape(-1)
+        chunk = tokens[s:s + seq_len].unsqueeze(0).to(device)
+        tgt = tokens[s + 1:s + 1 + seq_len].reshape(-1).to(device)
         opt.zero_grad()
         h = model.embed(chunk)
         logits = model.lm_head(h).reshape(-1, model.vocab_size)
@@ -352,7 +356,7 @@ def phase3_joint_1b(model: Fractus1B, tokens: torch.Tensor, *,
             pgsu.step_begin()
         opt.zero_grad()
         if use_amp:
-            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+            with torch.autocast(device_type=device.type, dtype=amp_dtype):
                 logits, aux = model(chunk)
                 ce = torch.nn.functional.cross_entropy(logits.reshape(-1, vocab), tgt)
                 loss = ce + aux_weight * torch.clamp(aux, max=1.0)
@@ -517,8 +521,12 @@ def arm_edt_vanilla_1b(model, *, train, holdout, budget, seq_len=64,
             model, train[:n1], after_block=l, chunk_len=chunk_len,
             n_chunks=max(n1 // chunk_len, 1), seed=0))
     p1 = phase1_experts_1b_shared(model, bank_per_block, steps=2000, lr=1e-3, seed=0)
-    p2a = phase2a_attention_1b(model, n_steps_per_layer=max(n2a // seq_len, 10),
-                               lr=1e-3, seq_len=seq_len, seed=0)
+    # Phase 2a budget accounting: each step processes batch_size*seq_len tokens per layer.
+    # n2a is the total token budget for 2a across all layers; per-layer step count =
+    # n2a / (n_layers * seq_len * batch_size). Phase 2a uses batch_size=16 by default.
+    p2a_batch = 16
+    p2a = phase2a_attention_1b(model, n_steps_per_layer=max(n2a // (n_layers * seq_len * p2a_batch), 10),
+                               lr=1e-3, seq_len=seq_len, batch_size=p2a_batch, seed=0)
     p2b = phase2b_embedding_1b(model, train[:n2b], steps=n2b // seq_len,
                                lr=1e-3, seq_len=seq_len, seed=0)
     p3 = phase3_joint_1b(model, train[:n3], steps=n3 // seq_len,
@@ -550,8 +558,9 @@ def arm_edt_spec_1b(model, *, train, holdout, budget, domain_split, seq_len=64,
         bank_per_block_per_expert.append(per_expert)
     p1 = phase1_experts_1b_partitioned(model, bank_per_block_per_expert,
                                        steps=2000, lr=1e-3, seed=0)
-    p2a = phase2a_attention_1b(model, n_steps_per_layer=max(n2a // seq_len, 10),
-                               lr=1e-3, seq_len=seq_len, seed=0)
+    p2a_batch = 16
+    p2a = phase2a_attention_1b(model, n_steps_per_layer=max(n2a // (n_layers * seq_len * p2a_batch), 10),
+                               lr=1e-3, seq_len=seq_len, batch_size=p2a_batch, seed=0)
     p2b = phase2b_embedding_1b(model, train[:n2b], steps=n2b // seq_len,
                                lr=1e-3, seq_len=seq_len, seed=0)
     p3 = phase3_joint_1b(model, train[:n3], steps=n3 // seq_len,

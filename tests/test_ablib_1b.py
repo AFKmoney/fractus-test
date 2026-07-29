@@ -71,3 +71,25 @@ def test_make_hidden_bank_1b_deeper_block_differs():
     b0 = ablib_1b.make_hidden_bank_1b(eng, tokens, after_block=0, chunk_len=16, n_chunks=3, seed=0)
     b1 = ablib_1b.make_hidden_bank_1b(eng, tokens, after_block=1, chunk_len=16, n_chunks=3, seed=0)
     assert not torch.allclose(b0["h_in"][0], b1["h_in"][0], atol=1e-5)
+
+
+def test_phase1_experts_1b_reduces_mse_one_expert():
+    eng = ablib_1b.build_engine_1b(seed=42, **REDUCED)
+    tokens = torch.arange(500, dtype=torch.int64) % 50257
+    bank = ablib_1b.make_hidden_bank_1b(eng, tokens, after_block=0, chunk_len=16, n_chunks=10, seed=0)
+    mse_before = ablib_1b._eval_expert_mse_1b(eng, block_idx=0, expert_idx=0, bank=bank)
+    ablib_1b._train_one_expert_1b(eng, block_idx=0, expert_idx=0, bank=bank,
+                                  steps=20, lr=1e-2, seed=0)
+    mse_after = ablib_1b._eval_expert_mse_1b(eng, block_idx=0, expert_idx=0, bank=bank)
+    assert mse_after < mse_before
+
+
+def test_phase1_experts_1b_natural_isolation():
+    """Training expert (0,0) must NOT move expert (0,1) — separate modules."""
+    eng = ablib_1b.build_engine_1b(seed=42, **REDUCED)
+    tokens = torch.arange(500, dtype=torch.int64) % 50257
+    bank = ablib_1b.make_hidden_bank_1b(eng, tokens, after_block=0, chunk_len=16, n_chunks=10, seed=0)
+    e1_before = eng.blocks[0].moe.experts_w1[1].U.detach().clone()
+    ablib_1b._train_one_expert_1b(eng, 0, 0, bank, steps=20, lr=1e-2, seed=0)
+    e1_after = eng.blocks[0].moe.experts_w1[1].U
+    assert torch.equal(e1_before, e1_after), "expert 1 moved while training expert 0"

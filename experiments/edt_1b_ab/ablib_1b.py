@@ -90,3 +90,101 @@ def make_hidden_bank_1b(model: Fractus1B, tokens: torch.Tensor, *,
         h_tgt_list.append(h[1:].clone())
     return {"h_in": torch.cat(h_in_list, dim=0),
             "h_target": torch.cat(h_tgt_list, dim=0)}
+
+
+# ============================================================================
+# Phase 1: per-expert pre-training on real hidden states (MSE on h_t -> h_{t+1}).
+#
+# At the 1B scale each expert is its OWN LazyStructuredSirenLinear module
+# (moe.experts_w1[e], moe.experts_w2[e] live in an nn.ModuleList). Training
+# expert i therefore physically cannot touch expert j — no gradient masking
+# is needed (unlike the 13M redesign, where experts shared one (E,...) tensor).
+# This natural isolation is pinned by test_phase1_experts_1b_natural_isolation.
+# ============================================================================
+
+
+def _expert_forward_1b(model: Fractus1B, block_idx: int, expert_idx: int,
+                       h: torch.Tensor) -> torch.Tensor:
+    """Output of one expert: gelu(w1(h)) -> w2. h: (..., d_model)."""
+    moe = model.blocks[block_idx].moe
+    w1 = moe.experts_w1[expert_idx]
+    w2 = moe.experts_w2[expert_idx]
+    h1 = w1(h)
+    h1_act = torch.nn.functional.gelu(h1)
+    return w2(h1_act)
+
+
+def _eval_expert_mse_1b(model: Fractus1B, block_idx: int, expert_idx: int,
+                        bank: dict) -> float:
+    model.eval()
+    with torch.no_grad():
+        out = _expert_forward_1b(model, block_idx, expert_idx, bank["h_in"])
+        return torch.nn.functional.mse_loss(out, bank["h_target"]).item()
+
+
+def _train_one_expert_1b(model: Fractus1B, block_idx: int, expert_idx: int,
+                         bank: dict, *, steps: int, lr: float,
+                         batch_size: int = 64, seed: int = 0) -> list:
+    """Train one expert (block_idx, expert_idx) on bank with MSE.
+
+    Natural isolation: each expert is a separate LazyStructuredSirenLinear module,
+    so the optimizer over that expert's params cannot touch other experts.
+    No gradient masking needed (unlike the 13M redesign).
+    """
+    model.train()
+    moe = model.blocks[block_idx].moe
+    params = list(moe.experts_w1[expert_idx].parameters()) + \
+             list(moe.experts_w2[expert_idx].parameters())
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
+    g = torch.Generator().manual_seed(seed)
+    n = bank["h_in"].size(0)
+    losses = []
+    for _ in range(steps):
+        idx_b = torch.randint(0, n, (batch_size,), generator=g)
+        h_in = bank["h_in"][idx_b]
+        h_tgt = bank["h_target"][idx_b]
+        opt.zero_grad()
+        out = _expert_forward_1b(model, block_idx, expert_idx, h_in)
+        loss = torch.nn.functional.mse_loss(out, h_tgt)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt.step()
+        losses.append(loss.item())
+    return losses
+
+
+def phase1_experts_1b_shared(model: Fractus1B, bank_per_block: list, *,
+                             steps: int = 2000, lr: float = 1e-3,
+                             batch_size: int = 64, seed: int = 0,
+                             log_every_block: bool = True) -> list:
+    """Arm B Phase 1: all experts trained on the SAME per-layer bank.
+
+    bank_per_block[l] is the hidden bank for the input of block l.
+    Trains every (block, expert) pair. Returns a flat losses list.
+    """
+    losses = []
+    for l in range(len(model.blocks)):
+        bank = bank_per_block[l]
+        for e in range(model.blocks[l].moe.n_experts):
+            losses.extend(_train_one_expert_1b(model, l, e, bank, steps=steps,
+                                               lr=lr, batch_size=batch_size,
+                                               seed=seed + l * 1000 + e))
+    return losses
+
+
+def phase1_experts_1b_partitioned(model: Fractus1B,
+                                  bank_per_block_per_expert: list, *,
+                                  steps: int = 2000, lr: float = 1e-3,
+                                  batch_size: int = 64, seed: int = 0) -> list:
+    """Arm C Phase 1: expert (l,e) trained only on bank_per_block_per_expert[l][e].
+
+    Disjoint per-expert data -> specialization.
+    """
+    losses = []
+    for l in range(len(model.blocks)):
+        for e in range(model.blocks[l].moe.n_experts):
+            bank = bank_per_block_per_expert[l][e]
+            losses.extend(_train_one_expert_1b(model, l, e, bank, steps=steps,
+                                               lr=lr, batch_size=batch_size,
+                                               seed=seed + l * 1000 + e))
+    return losses

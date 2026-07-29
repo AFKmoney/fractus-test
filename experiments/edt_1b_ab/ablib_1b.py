@@ -24,3 +24,27 @@ def build_engine_1b(seed: int = 42, **config) -> Fractus1B:
                siren_rank=64, max_seq_len=512)
     cfg.update(config)
     return Fractus1B(**cfg)
+
+
+def load_corpus_1b(path: str, *, n_train: int, n_holdout: int,
+                   n_phase1: int, n_experts: int, seed: int = 42) -> dict:
+    """Load + shuffle (fixed seed) + split. domain_split is n_experts contiguous slices.
+
+    Returns: train, holdout, phase1, domain_split (list of n_experts tensors).
+    """
+    tokens = torch.load(path, weights_only=False).to(torch.int64)
+    g = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(tokens.numel(), generator=g)
+    tokens = tokens[perm]
+
+    need = n_phase1 + n_train + n_holdout
+    assert tokens.numel() >= need, f"corpus {tokens.numel()} < need {need}"
+    phase1 = tokens[:n_phase1].clone()
+    train = tokens[n_phase1:n_phase1 + n_train].clone()
+    holdout = tokens[n_phase1 + n_train:n_phase1 + n_train + n_holdout].clone()
+
+    assert n_phase1 % n_experts == 0, "n_phase1 must be divisible by n_experts"
+    stride = n_phase1 // n_experts
+    domain_split = [phase1[i * stride:(i + 1) * stride].clone() for i in range(n_experts)]
+    return {"train": train, "holdout": holdout,
+            "phase1": phase1, "domain_split": domain_split}

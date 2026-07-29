@@ -28,3 +28,25 @@ def test_build_engine_1b_lm_head_tied():
     """lm_head.weight must BE embed.tok_embed.weight (tied)."""
     eng = ablib_1b.build_engine_1b(seed=42, **REDUCED)
     assert eng.lm_head.weight is eng.embed.tok_embed.weight
+
+
+import tempfile, os
+
+
+def _make_tiny_corpus(path, n=5000):
+    torch.manual_seed(0)
+    torch.save(torch.randint(0, 50257, (n,), dtype=torch.int32), path)
+
+
+def test_load_corpus_1b_splits_and_partitions():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "tiny.pt")
+        _make_tiny_corpus(p, n=5000)
+        split = ablib_1b.load_corpus_1b(p, n_train=1000, n_holdout=200,
+                                        n_phase1=512, n_experts=8, seed=42)
+    assert split["train"].numel() == 1000
+    assert split["holdout"].numel() == 200
+    assert split["phase1"].numel() == 512
+    assert len(split["domain_split"]) == 8
+    assert all(s.numel() == 64 for s in split["domain_split"])
+    assert torch.equal(torch.cat(split["domain_split"]), split["phase1"])

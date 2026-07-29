@@ -452,3 +452,111 @@ def greedy_sample_1b(model: Fractus1B, prompt: torch.Tensor,
         ids.append(nxt)
         cur = torch.tensor([[nxt]], dtype=torch.int64, device=device)
     return tok.decode(ids)
+
+
+# ============================================================================
+# Task 10: the three arm orchestrators (A from-scratch / B EDT vanilla /
+# C EDT+specialization).
+#
+# Each arm consumes the same total token budget N. Arms B and C split it
+# Phase 1 = 10%, Phase 2a = 15%, Phase 2b = 30%, Phase 3 = 45% (spec §5).
+# Arm A consumes all N in Phase 3.
+#
+# CRITICAL — experimental validity: arms B and C must be IDENTICAL except for
+# the Phase 1 call (shared per-layer banks vs partitioned per-layer-per-expert
+# banks). Phase 2a, Phase 2b, Phase 3, and _finalize_1b are byte-identical
+# between the two. Phase 1 steps are fixed at 2000 (a hyperparameter of EDT,
+# not budget-proportional).
+# ============================================================================
+
+PHASE1_FRAC, PHASE2A_FRAC, PHASE2B_FRAC, PHASE3_FRAC = 0.10, 0.15, 0.30, 0.45
+
+PROMPT_1B = torch.tensor([464, 1292, 13], dtype=torch.int64)  # "The dog." GPT-2 BPE
+
+
+def _probe_1b(holdout, n=64):
+    return holdout[:n].to(torch.int64)
+
+
+def _finalize_1b(model, holdout, losses, *, div_block=0) -> dict:
+    return {
+        "ppl": evaluate_ppl_1b(model, holdout),
+        "accuracy": None,
+        "diversity": expert_diversity_1b(model, _probe_1b(holdout), block_idx=div_block),
+        "losses": losses,
+        "sample": greedy_sample_1b(model, PROMPT_1B, n_tokens=80),
+    }
+
+
+def arm_from_scratch_1b(model, *, train, holdout, budget, seq_len=64,
+                        lr=3e-4, use_pgsu=True) -> dict:
+    """Arm A: full-budget joint training, no pre-training."""
+    n_layers = len(model.blocks)
+    div_block = min(8, n_layers - 1)
+    p3 = phase3_joint_1b(model, train[:budget], steps=budget // seq_len,
+                         lr=lr, seq_len=seq_len, use_pgsu=use_pgsu)
+    out = _finalize_1b(model, holdout, p3["losses"], div_block=div_block)
+    out["accuracy"] = p3["accuracy"]
+    return out
+
+
+def arm_edt_vanilla_1b(model, *, train, holdout, budget, seq_len=64,
+                       lr=3e-4, use_pgsu=True) -> dict:
+    """Arm B: EDT faithful to docs/EDT.md (per-layer shared banks)."""
+    n1 = int(budget * PHASE1_FRAC)
+    n2a = int(budget * PHASE2A_FRAC)
+    n2b = int(budget * PHASE2B_FRAC)
+    n3 = budget - n1 - n2a - n2b
+    n_layers = len(model.blocks)
+    div_block = min(8, n_layers - 1)
+
+    bank_per_block = []
+    chunk_len = 32
+    for l in range(n_layers):
+        bank_per_block.append(make_hidden_bank_1b(
+            model, train[:n1], after_block=l, chunk_len=chunk_len,
+            n_chunks=max(n1 // chunk_len, 1), seed=0))
+    p1 = phase1_experts_1b_shared(model, bank_per_block, steps=2000, lr=1e-3, seed=0)
+    p2a = phase2a_attention_1b(model, n_steps_per_layer=max(n2a // seq_len, 10),
+                               lr=1e-3, seq_len=seq_len, seed=0)
+    p2b = phase2b_embedding_1b(model, train[:n2b], steps=n2b // seq_len,
+                               lr=1e-3, seq_len=seq_len, seed=0)
+    p3 = phase3_joint_1b(model, train[:n3], steps=n3 // seq_len,
+                         lr=lr, seq_len=seq_len, use_pgsu=use_pgsu)
+    out = _finalize_1b(model, holdout, p3["losses"], div_block=div_block)
+    out.update({"phase1_losses": p1, "phase2a_losses": p2a, "phase2b_losses": p2b,
+                "phase3_losses": p3["losses"], "accuracy": p3["accuracy"]})
+    return out
+
+
+def arm_edt_spec_1b(model, *, train, holdout, budget, domain_split, seq_len=64,
+                    lr=3e-4, use_pgsu=True) -> dict:
+    """Arm C: EDT with per-expert disjoint domain banks (specialization)."""
+    n2a = int(budget * PHASE2A_FRAC)
+    n2b = int(budget * PHASE2B_FRAC)
+    n3 = budget - int(budget * PHASE1_FRAC) - n2a - n2b
+    n_layers = len(model.blocks)
+    n_experts = len(domain_split)
+    div_block = min(8, n_layers - 1)
+
+    bank_per_block_per_expert = []
+    chunk_len = 32
+    for l in range(n_layers):
+        per_expert = []
+        for e in range(n_experts):
+            per_expert.append(make_hidden_bank_1b(
+                model, domain_split[e], after_block=l, chunk_len=chunk_len,
+                n_chunks=max(domain_split[e].numel() // chunk_len, 1), seed=e))
+        bank_per_block_per_expert.append(per_expert)
+    p1 = phase1_experts_1b_partitioned(model, bank_per_block_per_expert,
+                                       steps=2000, lr=1e-3, seed=0)
+    p2a = phase2a_attention_1b(model, n_steps_per_layer=max(n2a // seq_len, 10),
+                               lr=1e-3, seq_len=seq_len, seed=0)
+    p2b = phase2b_embedding_1b(model, train[:n2b], steps=n2b // seq_len,
+                               lr=1e-3, seq_len=seq_len, seed=0)
+    p3 = phase3_joint_1b(model, train[:n3], steps=n3 // seq_len,
+                         lr=lr, seq_len=seq_len, use_pgsu=use_pgsu)
+    out = _finalize_1b(model, holdout, p3["losses"], div_block=div_block)
+    out.update({"phase1_losses": p1, "phase2a_losses": p2a, "phase2b_losses": p2b,
+                "phase3_losses": p3["losses"], "accuracy": p3["accuracy"]})
+    return out

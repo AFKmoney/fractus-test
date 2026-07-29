@@ -165,3 +165,35 @@ def test_greedy_sample_1b_returns_string():
     prompt = torch.tensor([1, 2, 3], dtype=torch.int64)
     s = ablib_1b.greedy_sample_1b(eng, prompt, n_tokens=8)
     assert isinstance(s, str) and len(s) > 0
+
+
+def test_arm_from_scratch_1b_smoke():
+    eng = ablib_1b.build_engine_1b(seed=42, **REDUCED)
+    tokens = torch.arange(3000, dtype=torch.int64) % 50257
+    out = ablib_1b.arm_from_scratch_1b(eng, train=tokens, holdout=tokens[2500:2800],
+                                       budget=1000, seq_len=16)
+    for k in ("ppl", "accuracy", "diversity", "losses", "sample"):
+        assert k in out
+
+
+def test_arm_edt_vanilla_1b_smoke():
+    eng = ablib_1b.build_engine_1b(seed=42, **REDUCED)
+    tokens = torch.arange(5000, dtype=torch.int64) % 50257
+    out = ablib_1b.arm_edt_vanilla_1b(eng, train=tokens, holdout=tokens[4500:4800],
+                                      budget=2000, seq_len=16)
+    for k in ("ppl", "phase1_losses", "phase2a_losses", "phase2b_losses",
+              "phase3_losses", "diversity", "sample"):
+        assert k in out
+
+
+def test_arm_edt_spec_1b_smoke():
+    eng = ablib_1b.build_engine_1b(seed=42, **REDUCED)
+    base = torch.arange(5000, dtype=torch.int64) % 50257
+    phase1 = base[:500]
+    n_experts = REDUCED["n_experts"]
+    domain_split = [phase1[i * (500 // n_experts):(i + 1) * (500 // n_experts)]
+                    for i in range(n_experts)]
+    out = ablib_1b.arm_edt_spec_1b(eng, train=base[500:], holdout=base[4500:4800],
+                                   budget=2000, domain_split=domain_split, seq_len=16)
+    for k in ("ppl", "phase1_losses", "phase3_losses", "diversity", "sample"):
+        assert k in out

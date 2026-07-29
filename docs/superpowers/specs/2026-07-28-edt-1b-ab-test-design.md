@@ -15,6 +15,12 @@ EDT is fundamentally a large-scale method. The white paper's headline claim (189
 
 **This spec prepares the decisive test.** The compute requirement (1.6 tok/s measured on the dev CPU; Chinchilla-scale = ~1.76B tokens for 88M trainable params) makes a full CPU run infeasible (~3 weeks for an under-budget, contestable result). The decision, taken with the user: **build the code now, validate it on CPU at smoke scale, run it on GPU when compute is available.**
 
+### Fractus is a living model, not a frozen artifact
+
+A core architectural premise that shapes this experiment: **Fractus is continuously trainable.** Unlike GPT/Llama (frozen weights after pre-training), Fractus is designed to grow — `scripts/rank_expand.py` already implements rank/expert/layer expansion that *copies existing trained weights* and initializes only the new parameters, so an 88M model can be expanded to 1B "already knowing what the 88M knew." The EDT method is the acceleration claimed for *every* training step in this lifecycle: from-scratch, expansion, or continual adaptation. Testing EDT rigorously matters precisely because Fractus will be retrained/expanded repeatedly, and a real ×186 speedup compounds across that lifecycle.
+
+Concretely for this spec: the AB test trains from-scratch (the cleanest test of the ×186 acceleration claim), but the **deliverable is a living checkpoint** — the trained model is reusable, expandable, and continuable via the existing `load_state_dict` / `rank_expand` machinery. The experiment does not assume the model is frozen after it runs. (A future, separate experiment — "EDT for expansion" — would test whether EDT accelerates integrating the *new* parameters added by `rank_expand`; that is out of scope here but is the natural practical follow-up.)
+
 ## 2. Claims to adjudicate
 
 Same structure as the 13M experiment, at 1B scale:
@@ -206,3 +212,5 @@ Because the full run waits for GPU, **the tests are the primary validation**. Ev
 ## 13. Relationship to the 13M result
 
 This experiment does **not** supersede the 13M result — it tests a different regime. If the 1B verdict is also negative, EDT is refuted at every scale tested and the project should stop claiming it works. If the 1B verdict is positive (EDT beats from-scratch), it confirms EDT at the decisive scale *and* explains the 13M negative as a scale artifact. Either outcome is publishable and honest.
+
+**Deliverable note:** the trained 1B from each arm is a *living checkpoint* — reusable, expandable (`scripts/rank_expand.py`), and continuable (`load_state_dict`). The experiment measures EDT's ×186 acceleration claim on a from-scratch run, but the output is not a frozen model; it is the seed for Fractus's next growth step. The natural follow-up experiment (out of scope here) is "EDT for expansion": take a trained checkpoint, expand its rank/experts/layers, and test whether EDT accelerates integrating the *new* parameters — the practical use case that the living-model premise makes central.

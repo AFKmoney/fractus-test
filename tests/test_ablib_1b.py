@@ -50,3 +50,24 @@ def test_load_corpus_1b_splits_and_partitions():
     assert len(split["domain_split"]) == 8
     assert all(s.numel() == 64 for s in split["domain_split"])
     assert torch.equal(torch.cat(split["domain_split"]), split["phase1"])
+
+
+def test_make_hidden_bank_1b_block0_uses_embedding():
+    eng = ablib_1b.build_engine_1b(seed=42, **REDUCED)
+    tokens = torch.arange(200, dtype=torch.int64) % 50257
+    bank0 = ablib_1b.make_hidden_bank_1b(eng, tokens, after_block=0,
+                                         chunk_len=16, n_chunks=5, seed=0)
+    eng.eval()
+    with torch.no_grad():
+        emb = eng.embed(tokens[:17].unsqueeze(0))  # (1, 17, D)
+    assert bank0["h_in"].shape[1] == eng.d_model
+    assert not torch.equal(bank0["h_in"][0], bank0["h_target"][0])
+
+
+def test_make_hidden_bank_1b_deeper_block_differs():
+    """Bank at block 1 must differ from block 0 (it passed through block 0)."""
+    eng = ablib_1b.build_engine_1b(seed=42, **REDUCED)
+    tokens = torch.arange(200, dtype=torch.int64) % 50257
+    b0 = ablib_1b.make_hidden_bank_1b(eng, tokens, after_block=0, chunk_len=16, n_chunks=3, seed=0)
+    b1 = ablib_1b.make_hidden_bank_1b(eng, tokens, after_block=1, chunk_len=16, n_chunks=3, seed=0)
+    assert not torch.allclose(b0["h_in"][0], b1["h_in"][0], atol=1e-5)

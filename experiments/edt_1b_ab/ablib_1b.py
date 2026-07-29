@@ -48,3 +48,45 @@ def load_corpus_1b(path: str, *, n_train: int, n_holdout: int,
     domain_split = [phase1[i * stride:(i + 1) * stride].clone() for i in range(n_experts)]
     return {"train": train, "holdout": holdout,
             "phase1": phase1, "domain_split": domain_split}
+
+
+def _partial_forward_to_block_input(model: Fractus1B,
+                                    chunk_ids: torch.Tensor,
+                                    after_block: int) -> torch.Tensor:
+    """Run embedding + blocks[0..after_block-1], return the INPUT to block `after_block`.
+
+    after_block=0 -> just the embedding.
+    after_block=l -> output of blocks[0..l-1].
+    chunk_ids: (1, L) token ids. Returns (1, L, d_model). No grad.
+    """
+    with torch.no_grad():
+        x = model.embed(chunk_ids)
+        for l in range(after_block):
+            x, _ = model.blocks[l](x)
+    return x
+
+
+def make_hidden_bank_1b(model: Fractus1B, tokens: torch.Tensor, *,
+                        after_block: int, chunk_len: int = 32,
+                        n_chunks: int = 1000, seed: int = 0) -> dict:
+    """Build (h_t, h_{t+1}) aligned pairs from the input of block `after_block`.
+
+    For each sampled chunk of chunk_len+1 tokens, embed+forward through blocks
+    [0..after_block-1] (no_grad), then emit (chunk_len) aligned pairs.
+    Returns {"h_in": (P, d_model), "h_target": (P, d_model)} where
+    P = n_chunks * chunk_len.
+    """
+    model.eval()
+    g = torch.Generator().manual_seed(seed)
+    n = tokens.numel()
+    assert n > chunk_len + 1
+    starts = torch.randint(0, n - chunk_len - 1, (n_chunks,), generator=g)
+    h_in_list, h_tgt_list = [], []
+    for s in starts.tolist():
+        chunk_ids = tokens[s:s + chunk_len + 1].unsqueeze(0)  # (1, chunk_len+1)
+        h = _partial_forward_to_block_input(model, chunk_ids, after_block)  # (1, L, D)
+        h = h.squeeze(0)  # (L, D)
+        h_in_list.append(h[:-1].clone())
+        h_tgt_list.append(h[1:].clone())
+    return {"h_in": torch.cat(h_in_list, dim=0),
+            "h_target": torch.cat(h_tgt_list, dim=0)}

@@ -132,3 +132,15 @@ def test_phase2b_embedding_1b_tied_and_reduces_ce():
     for n, p in eng.named_parameters():
         if n in frozen_before:
             assert torch.equal(p, frozen_before[n]), f"{n} moved in Phase 2b"
+
+
+def test_phase3_joint_1b_reduces_loss_returns_curve():
+    eng = ablib_1b.build_engine_1b(seed=42, **REDUCED)
+    tokens = torch.arange(2000, dtype=torch.int64) % 50257
+    out = ablib_1b.phase3_joint_1b(eng, tokens, steps=30, lr=1e-3,
+                                   seq_len=16, use_pgsu=False)
+    assert "losses" in out and "avg_loss" in out and "accuracy" in out
+    half = len(out["losses"]) // 2
+    assert sum(out["losses"][half:]) / max(len(out["losses"]) - half, 1) < \
+           sum(out["losses"][:half]) / max(half, 1)
+    assert all(p.requires_grad for p in eng.parameters())

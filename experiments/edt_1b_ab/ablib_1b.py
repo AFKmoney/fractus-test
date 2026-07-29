@@ -297,3 +297,79 @@ def phase2b_embedding_1b(model: Fractus1B, tokens: torch.Tensor, *,
     for p in model.parameters():
         p.requires_grad_(True)
     return losses
+
+
+# ============================================================================
+# Phase 3: full-model joint fine-tune (the only phase that trains everything).
+#
+# Aligns all pre-trained components end-to-end: experts (Phase 1), attentions
+# (Phase 2a), embedding/head (Phase 2b). Three 1B-specific features:
+#   1. aux_loss (MoE load-balance summed across all 16 blocks) is ADDED to the
+#      CE — coefficient 0.001, clamped at 1.0 to prevent a divergent load-balance
+#      term from blowing up training. (At 13M aux_loss was exposed but unused.)
+#   2. PGSU (Phase-Gated Sparse Update): n_active=4 of 16 blocks receive
+#      gradients per step, rotating each step. Reduces backward cost ~4x.
+#   3. AMP (bf16 autocast) on GPU; no-op on CPU. Auto-detected from device.
+# ============================================================================
+
+
+def phase3_joint_1b(model: Fractus1B, tokens: torch.Tensor, *,
+                    steps: int, lr: float = 3e-4, seq_len: int = 64,
+                    use_pgsu: bool = True, aux_weight: float = 0.001,
+                    use_amp: bool = None, seed: int = 0) -> dict:
+    """Phase 3: full-model joint training. chunked-CE + PGSU + AMP + load-balance aux_loss.
+
+    steps = number of optimizer steps. tokens consumed = steps * seq_len.
+    """
+    model.train()
+    for p in model.parameters():
+        p.requires_grad_(True)
+    device = next(model.parameters()).device
+    if use_amp is None:
+        use_amp = device.type == "cuda"
+    amp_dtype = torch.bfloat16 if use_amp else None
+
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    pgsu = None
+    if use_pgsu:
+        try:
+            from fractus1B.pgsu import PGSU
+            pgsu = PGSU(model, n_active=4)
+        except Exception:
+            pgsu = None
+
+    g = torch.Generator().manual_seed(seed)
+    n = tokens.numel()
+    losses, total_loss, correct, total = [], 0.0, 0, 0
+    vocab = model.vocab_size
+    for _ in range(steps):
+        s = torch.randint(0, n - seq_len - 1, (1,), generator=g).item()
+        chunk = tokens[s:s + seq_len].unsqueeze(0).to(device)
+        tgt = tokens[s + 1:s + 1 + seq_len].reshape(-1).to(device)
+        if pgsu is not None:
+            pgsu.step_begin()
+        opt.zero_grad()
+        if use_amp:
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                logits, aux = model(chunk)
+                ce = torch.nn.functional.cross_entropy(logits.reshape(-1, vocab), tgt)
+                loss = ce + aux_weight * torch.clamp(aux, max=1.0)
+        else:
+            logits, aux = model(chunk)
+            ce = torch.nn.functional.cross_entropy(logits.reshape(-1, vocab), tgt)
+            loss = ce + aux_weight * torch.clamp(aux, max=1.0)
+        if not torch.isfinite(loss):
+            if pgsu is not None:
+                pgsu.step_end()
+            continue
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        if pgsu is not None:
+            pgsu.step_end()
+        losses.append(loss.item())
+        total_loss += loss.item() * seq_len
+        correct += (logits.reshape(-1, vocab).argmax(-1) == tgt).sum().item()
+        total += seq_len
+    return {"losses": losses, "avg_loss": total_loss / max(total, 1),
+            "accuracy": correct / max(total, 1), "steps": total}

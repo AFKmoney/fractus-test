@@ -188,3 +188,51 @@ def phase1_experts_1b_partitioned(model: Fractus1B,
                                                lr=lr, batch_size=batch_size,
                                                seed=seed + l * 1000 + e))
     return losses
+
+
+# ============================================================================
+# Phase 2a: standalone attention pre-training (per layer).
+#
+# Each FractalBlockSparse has its own FractalLinearAttention + norm1. Phase 2a
+# trains each layer's attention INDEPENDENTLY as a denoising autoencoder:
+# input h (random hidden states), target h + 0.1·noise. The attention learns to
+# preserve h's structure while suppressing the noise (self-supervised, as in the
+# EDT doc). This mirrors FractalBlockSparse.forward: h_out = h + attn(norm1(h)).
+# An optimizer scoped to attn.parameters() + norm1.parameters() means every other
+# parameter in the model receives no gradient and stays bit-identical (pinned by
+# test_phase2a_attention_1b_reduces_loss_and_isolates).
+# ============================================================================
+
+
+def phase2a_attention_1b(model: Fractus1B, *, n_steps_per_layer: int = 5000,
+                         lr: float = 1e-3, seq_len: int = 16,
+                         batch_size: int = 16, seed: int = 0) -> list:
+    """Phase 2a: train each block's attention + norm1 standalone (denoising target).
+
+    Target = h + 0.1·noise (self-supervised denoising, as in the EDT doc).
+    Returns per-step losses of the FIRST block (representative; full loss list
+    would be huge for 16 layers × 5000 steps).
+    """
+    model.train()
+    g = torch.Generator().manual_seed(seed)
+    d = model.d_model
+    first_block_losses = []
+    for l in range(len(model.blocks)):
+        attn = model.blocks[l].attn
+        norm = model.blocks[l].norm1
+        params = list(attn.parameters()) + list(norm.parameters())
+        opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
+        for step in range(n_steps_per_layer):
+            h = torch.randn(batch_size, seq_len, d, generator=g)
+            target = h + 0.1 * torch.randn_like(h)
+            opt.zero_grad()
+            h_normed = norm(h)
+            attn_out = attn(h_normed)
+            h_out = h + attn_out
+            loss = torch.nn.functional.mse_loss(h_out, target)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step()
+            if l == 0:
+                first_block_losses.append(loss.item())
+    return first_block_losses

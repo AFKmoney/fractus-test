@@ -93,3 +93,24 @@ def test_phase1_experts_1b_natural_isolation():
     ablib_1b._train_one_expert_1b(eng, 0, 0, bank, steps=20, lr=1e-2, seed=0)
     e1_after = eng.blocks[0].moe.experts_w1[1].U
     assert torch.equal(e1_before, e1_after), "expert 1 moved while training expert 0"
+
+
+def test_phase2a_attention_1b_reduces_loss_and_isolates():
+    eng = ablib_1b.build_engine_1b(seed=42, **REDUCED)
+    # Phase 2a trains attn + norm1 of EVERY block; the freeze set must exclude
+    # all of them, leaving only genuinely-frozen params (embed, lm_head, norm,
+    # norm_kur, kuramoto, norm_moe, moe of each block).
+    attn_params = set()
+    for blk in eng.blocks:
+        attn_params |= set(id(p) for p in blk.attn.parameters())
+        attn_params |= set(id(p) for p in blk.norm1.parameters())
+    frozen_before = {id(p): p.detach().clone() for p in eng.parameters()
+                     if id(p) not in attn_params}
+    torch.manual_seed(0)
+    losses = ablib_1b.phase2a_attention_1b(eng, n_steps_per_layer=20, lr=1e-2,
+                                           seq_len=16, batch_size=8, seed=0)
+    half = len(losses) // 2
+    assert sum(losses[half:]) / max(len(losses) - half, 1) < sum(losses[:half]) / max(half, 1)
+    for p in eng.parameters():
+        if id(p) in frozen_before:
+            assert torch.equal(p, frozen_before[id(p)]), "frozen param moved in Phase 2a"

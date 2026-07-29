@@ -236,3 +236,64 @@ def phase2a_attention_1b(model: Fractus1B, *, n_steps_per_layer: int = 5000,
             if l == 0:
                 first_block_losses.append(loss.item())
     return first_block_losses
+
+
+# ============================================================================
+# Phase 2b: tied embedding + lm_head next-token training.
+#
+# At 1B the lm_head is TIED to the token embedding: lm_head.weight IS
+# embed.tok_embed.weight (same tensor object — Fractus1B.__init__ line 260).
+# So an optimizer over embed.tok_embed.parameters() trains BOTH the embedding
+# AND the head simultaneously — there is only one parameter to optimize. This
+# differs from the 13M CTE where the head was a separate untied Linear.
+# Phase 2b trains ONLY tok_embed (and its tied head); pos_embed and embed.norm
+# stay frozen. All params are restored to requires_grad=True at the end so
+# Phase 3 can train everything.
+# ============================================================================
+
+
+def _eval_ce_1b(model: Fractus1B, tokens: torch.Tensor,
+                seq_len: int = 16) -> float:
+    """Mean per-token CE of embed -> lm_head (no blocks). lm_head is tied to tok_embed."""
+    model.eval()
+    total, n = 0.0, 0
+    with torch.no_grad():
+        for s in range(0, tokens.numel() - seq_len - 1, seq_len):
+            chunk = tokens[s:s + seq_len].unsqueeze(0)
+            tgt = tokens[s + 1:s + 1 + seq_len].reshape(-1)
+            h = model.embed(chunk)
+            logits = model.lm_head(h).reshape(-1, model.vocab_size)
+            total += torch.nn.functional.cross_entropy(logits, tgt, reduction="sum").item()
+            n += tgt.numel()
+    return total / max(n, 1)
+
+
+def phase2b_embedding_1b(model: Fractus1B, tokens: torch.Tensor, *,
+                         steps: int = 2000, lr: float = 1e-3,
+                         seq_len: int = 16, seed: int = 0) -> list:
+    """Phase 2b: train embed.tok_embed on next-token CE (lm_head is tied -> trains too)."""
+    model.train()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    for p in model.embed.tok_embed.parameters():
+        p.requires_grad_(True)  # lm_head.weight IS this tensor (tied).
+
+    opt = torch.optim.AdamW(model.embed.tok_embed.parameters(), lr=lr, weight_decay=0.0)
+    g = torch.Generator().manual_seed(seed)
+    n = tokens.numel()
+    losses = []
+    for _ in range(steps):
+        s = torch.randint(0, n - seq_len - 1, (1,), generator=g).item()
+        chunk = tokens[s:s + seq_len].unsqueeze(0)
+        tgt = tokens[s + 1:s + 1 + seq_len].reshape(-1)
+        opt.zero_grad()
+        h = model.embed(chunk)
+        logits = model.lm_head(h).reshape(-1, model.vocab_size)
+        loss = torch.nn.functional.cross_entropy(logits, tgt)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.embed.tok_embed.parameters(), 1.0)
+        opt.step()
+        losses.append(loss.item())
+    for p in model.parameters():
+        p.requires_grad_(True)
+    return losses

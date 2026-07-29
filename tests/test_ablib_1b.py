@@ -114,3 +114,21 @@ def test_phase2a_attention_1b_reduces_loss_and_isolates():
     for p in eng.parameters():
         if id(p) in frozen_before:
             assert torch.equal(p, frozen_before[id(p)]), "frozen param moved in Phase 2a"
+
+
+def test_phase2b_embedding_1b_tied_and_reduces_ce():
+    eng = ablib_1b.build_engine_1b(seed=42, **REDUCED)
+    frozen_names = [n for n, _ in eng.named_parameters()
+                    if not n.startswith("embed.tok_embed.")]
+    frozen_before = {n: p.detach().clone() for n, p in eng.named_parameters()
+                     if n in frozen_names}
+    tokens = torch.arange(2000, dtype=torch.int64) % 50257
+    ce_before = ablib_1b._eval_ce_1b(eng, tokens[:500])
+    losses = ablib_1b.phase2b_embedding_1b(eng, tokens, steps=30, lr=1e-2,
+                                           seq_len=16, seed=0)
+    ce_after = ablib_1b._eval_ce_1b(eng, tokens[:500])
+    assert ce_after < ce_before
+    assert eng.lm_head.weight is eng.embed.tok_embed.weight
+    for n, p in eng.named_parameters():
+        if n in frozen_before:
+            assert torch.equal(p, frozen_before[n]), f"{n} moved in Phase 2b"

@@ -7,6 +7,8 @@ attention pre-training, tied embedding Phase 2b, PGSU+AMP Phase 3.
 The full run requires GPU; tests run on CPU at reduced config.
 """
 
+import math
+
 import torch
 
 from fractus1B.model_1b import Fractus1B
@@ -373,3 +375,80 @@ def phase3_joint_1b(model: Fractus1B, tokens: torch.Tensor, *,
         total += seq_len
     return {"losses": losses, "avg_loss": total_loss / max(total, 1),
             "accuracy": correct / max(total, 1), "steps": total}
+
+
+# ============================================================================
+# End-of-arm evaluators (Task 9).
+#
+#   - evaluate_ppl_1b:   full-model forward PPL on hold-out (NLL cap 20).
+#   - expert_diversity_1b: mean off-diagonal cosine between expert outputs of
+#     ONE representative block (default block 8, the middle of 16). Computing
+#     all 16x128 experts pairwise would be 16x the cost and uninformative.
+#   - greedy_sample_1b:  greedy decode via single-token forward. Slow
+#     (n_tokens forwards) but simple. Qualitative only at the 1B real run.
+# ============================================================================
+
+
+def evaluate_ppl_1b(model: Fractus1B, tokens: torch.Tensor,
+                    seq_len: int = 64, nll_cap: float = 20.0) -> float:
+    """Perplexity via full-model forward (logits, aux_loss)."""
+    model.eval()
+    device = next(model.parameters()).device
+    total_nll, n = 0.0, 0
+    for s in range(0, tokens.numel() - seq_len - 1, seq_len):
+        chunk = tokens[s:s + seq_len].unsqueeze(0).to(device)
+        tgt = tokens[s + 1:s + 1 + seq_len].reshape(-1).to(device)
+        with torch.no_grad():
+            logits, _ = model(chunk)
+            nll = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, model.vocab_size), tgt, reduction="none")
+            nll = nll.clamp(max=nll_cap)
+        total_nll += nll.sum().item()
+        n += tgt.numel()
+    return math.exp(total_nll / max(n, 1))
+
+
+def expert_diversity_1b(model: Fractus1B, probe_tokens: torch.Tensor,
+                        block_idx: int = 8) -> float:
+    """Mean off-diagonal cosine between expert outputs of one representative block.
+
+    probe_tokens: (P,) -> embed -> each expert of blocks[block_idx].moe.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        h = model.embed(probe_tokens.unsqueeze(0).to(device)).squeeze(0)  # (P, D)
+        moe = model.blocks[block_idx].moe
+        outs = []
+        for e in range(moe.n_experts):
+            outs.append(_expert_forward_1b(model, block_idx, e, h))
+        outs = torch.stack(outs)  # (E, P, D)
+    E = outs.size(0)
+    cos_sum, count = 0.0, 0
+    for i in range(E):
+        for j in range(E):
+            if i == j:
+                continue
+            cos = torch.nn.functional.cosine_similarity(
+                outs[i].flatten(), outs[j].flatten(), dim=0).item()
+            cos_sum += cos
+            count += 1
+    return cos_sum / max(count, 1)
+
+
+def greedy_sample_1b(model: Fractus1B, prompt: torch.Tensor,
+                     n_tokens: int = 80) -> str:
+    """Greedy decode n_tokens after prompt (single-token forward)."""
+    from fractus1B.tokenizer import FractusTokenizer
+    tok = FractusTokenizer.gpt2_compatible()
+    model.eval()
+    device = next(model.parameters()).device
+    ids = prompt.tolist()
+    cur = torch.tensor(ids[-1:], dtype=torch.int64, device=device).unsqueeze(0)
+    for _ in range(n_tokens):
+        with torch.no_grad():
+            logits, _ = model(cur)  # (1, 1, vocab)
+        nxt = int(logits[0, -1].argmax(-1).item())
+        ids.append(nxt)
+        cur = torch.tensor([[nxt]], dtype=torch.int64, device=device)
+    return tok.decode(ids)

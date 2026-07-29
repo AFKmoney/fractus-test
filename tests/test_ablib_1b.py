@@ -144,3 +144,24 @@ def test_phase3_joint_1b_reduces_loss_returns_curve():
     assert sum(out["losses"][half:]) / max(len(out["losses"]) - half, 1) < \
            sum(out["losses"][:half]) / max(half, 1)
     assert all(p.requires_grad for p in eng.parameters())
+
+
+def test_evaluate_ppl_1b_finite_positive():
+    eng = ablib_1b.build_engine_1b(seed=42, **REDUCED)
+    tokens = torch.arange(500, dtype=torch.int64) % 50257
+    ppl = ablib_1b.evaluate_ppl_1b(eng, tokens[:300], seq_len=16)
+    assert ppl == ppl and ppl > 0.0
+
+
+def test_expert_diversity_1b_in_range():
+    eng = ablib_1b.build_engine_1b(seed=42, **REDUCED)
+    probe = torch.arange(64, dtype=torch.int64) % 50257
+    div = ablib_1b.expert_diversity_1b(eng, probe, block_idx=0)
+    assert -1.0 <= div <= 1.0
+
+
+def test_greedy_sample_1b_returns_string():
+    eng = ablib_1b.build_engine_1b(seed=42, **REDUCED)
+    prompt = torch.tensor([1, 2, 3], dtype=torch.int64)
+    s = ablib_1b.greedy_sample_1b(eng, prompt, n_tokens=8)
+    assert isinstance(s, str) and len(s) > 0

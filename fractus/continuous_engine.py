@@ -170,12 +170,14 @@ class ContinuousThoughtEngine(nn.Module):
         dominance = self._expert_hits.max().item() / max(total, 1)
         if dominance < imbalance_threshold:
             return False
-        # Grow!
-        new_idx = self.moe.add_expert()
+        # Grow! Place the new expert NEAR the dominant expert (to capture overflow)
+        # with ZERO init (no perturbation to the forward pass).
+        dominant_idx = self._expert_hits.argmax().item()
+        new_idx = self.moe.add_expert(dominant_idx=dominant_idx)
         self._last_grow_tick = self._tick_count
         self._expert_hits = torch.zeros(self.moe.n_experts)
-        print(f"[Fractus] Self-modified: grew expert {new_idx} "
-              f"(now {self.moe.n_experts} experts, dominance was {dominance:.2f})", flush=True)
+        print(f"[Fractus] Self-modified: grew expert {new_idx} near dominant expert "
+              f"{dominant_idx} (now {self.moe.n_experts} experts, dominance was {dominance:.2f})", flush=True)
         return True
 
     def attach_memory(self, memory):

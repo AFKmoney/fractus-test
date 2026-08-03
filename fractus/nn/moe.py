@@ -124,65 +124,66 @@ class PhaseRoutedMoE(nn.Module):
         gates = torch.where(gates_sum > 1e-10, gates / gates_sum, uniform)
         return gates
 
-    def add_expert(self, phase: float = None) -> int:
+    def add_expert(self, phase: float = None, dominant_idx: int = None) -> int:
         """Add a new expert at runtime (self-modification).
 
         Grows every (E, ...) parameter by one row along dim 0, adds a new
-        Farey phase for routing, and increments n_experts. The new expert's
-        weights are initialized with the same Xavier/uniform scheme as __init__.
+        phase for routing, and increments n_experts.
 
-        This is what makes Fractus SELF-MODIFIABLE: the model can grow new
-        capacity while it runs, not just via an offline script.
+        Stability design (validated post-hoc):
+          - The new expert is placed NEAR the dominant expert's phase (slightly
+            offset) so it captures traffic from the overloaded region — not in
+            an empty gap where no token phases land.
+          - Weights are initialized to ZERO (U/V/scale all zero). A zero expert
+            outputs nothing → no perturbation to the forward pass → no gradient
+            spike. It "warms up" gradually via backprop.
 
         Args:
-            phase: optional phase for the new expert. If None, placed at the
-                   midpoint of the largest gap in the existing phase distribution.
+            phase: optional explicit phase for the new expert.
+            dominant_idx: index of the expert to split traffic from. If None,
+                          uses the midpoint of the largest gap (legacy behavior).
         Returns:
             The index of the newly added expert.
         """
         old_E = self.n_experts
         new_E = old_E + 1
 
-        # Choose a phase for the new expert (midpoint of largest gap).
+        # Choose a phase: near the dominant expert (slight offset) to capture
+        # its overflow traffic, or explicit.
         if phase is None:
-            sorted_phases = self.expert_phases.sort().values
-            gaps = torch.diff(sorted_phases)
-            # Also consider wraparound gap.
-            wrap = sorted_phases[0] + 2 * math.pi - sorted_phases[-1]
-            gaps = torch.cat([gaps, wrap.unsqueeze(0)])
-            max_gap_idx = gaps.argmax().item()
-            if max_gap_idx == len(gaps) - 1:
-                phase = float((sorted_phases[-1] + sorted_phases[0] + 2 * math.pi) / 2 % (2 * math.pi))
+            if dominant_idx is not None and dominant_idx < old_E:
+                # Place near the dominant expert, offset by a small amount.
+                offset = 2 * math.pi / (old_E * 4)  # quarter of the average spacing
+                phase = float((self.expert_phases[dominant_idx].item() + offset) % (2 * math.pi))
             else:
-                phase = float((sorted_phases[max_gap_idx] + sorted_phases[max_gap_idx + 1]) / 2)
+                # Legacy: midpoint of largest gap.
+                sorted_phases = self.expert_phases.sort().values
+                gaps = torch.diff(sorted_phases)
+                wrap = sorted_phases[0] + 2 * math.pi - sorted_phases[-1]
+                gaps = torch.cat([gaps, wrap.unsqueeze(0)])
+                max_gap_idx = gaps.argmax().item()
+                if max_gap_idx == len(gaps) - 1:
+                    phase = float((sorted_phases[-1] + sorted_phases[0] + 2 * math.pi) / 2 % (2 * math.pi))
+                else:
+                    phase = float((sorted_phases[max_gap_idx] + sorted_phases[max_gap_idx + 1]) / 2)
         new_phase = torch.tensor([phase], dtype=self.expert_phases.dtype)
         self.expert_phases = torch.cat([self.expert_phases, new_phase])
 
         if self.expert_rank is None:
-            # Dense mode.
-            scale1 = math.sqrt(2.0 / self.d_model)
-            scale2 = math.sqrt(2.0 / self.d_ff)
-            new_w1 = torch.empty(1, self.d_model, self.d_ff).uniform_(-scale1, scale1)
-            new_b1 = torch.zeros(1, self.d_ff)
-            new_w2 = torch.empty(1, self.d_ff, self.d_model).uniform_(-scale2, scale2)
-            new_b2 = torch.zeros(1, self.d_model)
-            self.w1 = nn.Parameter(torch.cat([self.w1.data, new_w1]))
-            self.b1 = nn.Parameter(torch.cat([self.b1.data, new_b1]))
-            self.w2 = nn.Parameter(torch.cat([self.w2.data, new_w2]))
-            self.b2 = nn.Parameter(torch.cat([self.b2.data, new_b2]))
+            # Dense mode: zero init (stable — no perturbation).
+            self.w1 = nn.Parameter(torch.cat([self.w1.data, torch.zeros(1, self.d_model, self.d_ff)]))
+            self.b1 = nn.Parameter(torch.cat([self.b1.data, torch.zeros(1, self.d_ff)]))
+            self.w2 = nn.Parameter(torch.cat([self.w2.data, torch.zeros(1, self.d_ff, self.d_model)]))
+            self.b2 = nn.Parameter(torch.cat([self.b2.data, torch.zeros(1, self.d_model)]))
         else:
-            # Low-rank mode.
+            # Low-rank mode: zero init (stable — scale=0 means output=0).
             r = self.expert_rank
-            su1 = math.sqrt(2.0 / (self.d_ff + r))
-            sv1 = math.sqrt(2.0 / (self.d_model + r))
-            su2 = math.sqrt(2.0 / (self.d_model + r))
-            sv2 = math.sqrt(2.0 / (self.d_ff + r))
-            self.U1 = nn.Parameter(torch.cat([self.U1.data, torch.empty(1, self.d_ff, r).uniform_(-su1, su1)]))
-            self.V1 = nn.Parameter(torch.cat([self.V1.data, torch.empty(1, self.d_model, r).uniform_(-sv1, sv1)]))
-            self.U2 = nn.Parameter(torch.cat([self.U2.data, torch.empty(1, self.d_model, r).uniform_(-su2, su2)]))
-            self.V2 = nn.Parameter(torch.cat([self.V2.data, torch.empty(1, self.d_ff, r).uniform_(-sv2, sv2)]))
-            self.scale1 = nn.Parameter(torch.cat([self.scale1.data, torch.ones(1, 1, 1)]))
-            self.scale2 = nn.Parameter(torch.cat([self.scale2.data, torch.ones(1, 1, 1)]))
+            self.U1 = nn.Parameter(torch.cat([self.U1.data, torch.zeros(1, self.d_ff, r)]))
+            self.V1 = nn.Parameter(torch.cat([self.V1.data, torch.zeros(1, self.d_model, r)]))
+            self.U2 = nn.Parameter(torch.cat([self.U2.data, torch.zeros(1, self.d_model, r)]))
+            self.V2 = nn.Parameter(torch.cat([self.V2.data, torch.zeros(1, self.d_ff, r)]))
+            self.scale1 = nn.Parameter(torch.cat([self.scale1.data, torch.zeros(1, 1, 1)]))
+            self.scale2 = nn.Parameter(torch.cat([self.scale2.data, torch.zeros(1, 1, 1)]))
             self.b1 = nn.Parameter(torch.cat([self.b1.data, torch.zeros(1, self.d_ff)]))
             self.b2 = nn.Parameter(torch.cat([self.b2.data, torch.zeros(1, self.d_model)]))
 

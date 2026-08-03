@@ -351,18 +351,19 @@ def phase3_joint_1b(model: Fractus1B, tokens: torch.Tensor, *,
     for _ in range(steps):
         s = torch.randint(0, n - seq_len - 1, (1,), generator=g).item()
         chunk = tokens[s:s + seq_len].unsqueeze(0).to(device)
-        tgt = tokens[s + 1:s + 1 + seq_len].reshape(-1).to(device)
+        # Fast training path: head on LAST position only (seq_len x less head FLOPs).
+        target = tokens[s + seq_len].to(device)  # token after the chunk
         if pgsu is not None:
             pgsu.step_begin()
         opt.zero_grad()
         if use_amp:
             with torch.autocast(device_type=device.type, dtype=amp_dtype):
-                logits, aux = model(chunk)
-                ce = torch.nn.functional.cross_entropy(logits.reshape(-1, vocab), tgt)
+                last_logits, aux = model.forward_train(chunk)
+                ce = torch.nn.functional.cross_entropy(last_logits, target.unsqueeze(0))
                 loss = ce + aux_weight * torch.clamp(aux, max=1.0)
         else:
-            logits, aux = model(chunk)
-            ce = torch.nn.functional.cross_entropy(logits.reshape(-1, vocab), tgt)
+            last_logits, aux = model.forward_train(chunk)
+            ce = torch.nn.functional.cross_entropy(last_logits, target.unsqueeze(0))
             loss = ce + aux_weight * torch.clamp(aux, max=1.0)
         if not torch.isfinite(loss):
             if pgsu is not None:
@@ -374,9 +375,9 @@ def phase3_joint_1b(model: Fractus1B, tokens: torch.Tensor, *,
         if pgsu is not None:
             pgsu.step_end()
         losses.append(loss.item())
-        total_loss += loss.item() * seq_len
-        correct += (logits.reshape(-1, vocab).argmax(-1) == tgt).sum().item()
-        total += seq_len
+        total_loss += loss.item()
+        correct += (last_logits.argmax(-1) == target.unsqueeze(0)).sum().item()
+        total += 1
     return {"losses": losses, "avg_loss": total_loss / max(total, 1),
             "accuracy": correct / max(total, 1), "steps": total}
 

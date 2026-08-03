@@ -287,6 +287,27 @@ class Fractus1B(nn.Module):
         logits = self.lm_head(x)
         return logits, aux_loss
 
+    def forward_train(self, ids: torch.Tensor) -> tuple:
+        """Fast training forward: head on LAST position only.
+
+        Same as forward() but computes lm_head only on the last position —
+        the token to predict after the sequence. The full 16-block stack runs
+        on all positions (context building), but the output projection is 1
+        position instead of L. At L=64, vocab=50257, d=1280 that's 64x less
+        head FLOPs.
+
+        Returns: (last_logits (B, vocab), aux_loss scalar).
+        """
+        x = self.embed(ids)
+        aux_loss = torch.tensor(0.0, device=x.device)
+        for block in self.blocks:
+            x_new, lb = block(x)
+            x = x_new
+            aux_loss = aux_loss + lb
+        x = self.norm(x)
+        last_logits = self.lm_head(x[:, -1, :])  # (B, vocab) — last position only
+        return last_logits, aux_loss
+
     def n_params(self) -> int:
         """Actual trainable parameter count."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

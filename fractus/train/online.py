@@ -187,13 +187,14 @@ class OnlineTrainer:
 
         for start in range(0, len(token_ids) - chunk_len - 1, chunk_len):
             chunk = token_ids[start:start + chunk_len].unsqueeze(0)  # (1, C)
-            target = token_ids[start + 1:start + chunk_len + 1].unsqueeze(0)  # (1, C)
 
-            # One forward over the whole chunk.
-            logits = self.engine.tick_chunk(chunk)  # (1, C, vocab)
+            # Fast training path: head on LAST position only.
+            # The chunk builds context; prediction is on the final thought state.
+            last_logits = self.engine.tick_chunk_train(chunk)  # (1, vocab)
+            target = token_ids[start + chunk_len]  # scalar: the token after the chunk
 
-            # Cross-entropy on all positions.
-            loss = F.cross_entropy(logits.reshape(-1, vocab), target.reshape(-1))
+            # CE on the single predicted token.
+            loss = F.cross_entropy(last_logits, target.unsqueeze(0))
 
             # One backward + step per chunk.
             self.optimizer.zero_grad()
@@ -202,10 +203,10 @@ class OnlineTrainer:
             self.optimizer.step()
             self.step_count += 1
 
-            total_loss += loss.item() * chunk_len
-            preds = logits.argmax(dim=-1)
-            correct += (preds == target).sum().item()
-            total += chunk_len
+            total_loss += loss.item()
+            pred = last_logits.argmax(dim=-1)
+            correct += (pred == target.unsqueeze(0)).sum().item()
+            total += 1
             self.losses.append(loss.item())
 
         return {

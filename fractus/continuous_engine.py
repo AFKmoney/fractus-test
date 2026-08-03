@@ -108,8 +108,12 @@ class ContinuousThoughtEngine(nn.Module):
         # 4. Confidence head: "how sure am I about the current thought?"
         self.confidence_head = nn.Linear(d_model, 1)
 
-        # 5. Output head: "what do I want to say?"
+        # 5. Output head: TIED with the embedding (like Fractus1B).
+        #    The embedding and the output projection share the same weight matrix.
+        #    This halves the vocab params (6.4M → shared) and lets the CE backward
+        #    and embedding backward accumulate on the same tensor.
         self.output_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.output_head.weight = self.observe.weight  # tied
 
         # 6. Salience head: "is this thought worth remembering?" (for PersistentMemory)
         self.salience_head = nn.Linear(d_model, 1)
@@ -394,6 +398,78 @@ class ContinuousThoughtEngine(nn.Module):
         # 5. Output logits for the whole chunk.
         output_logits = self.output_head(h)  # (B, C, vocab)
         return output_logits
+
+    def tick_chunk_train(self, observations: torch.Tensor) -> torch.Tensor:
+        """Fast training forward: head on LAST position only (16x less head FLOPs).
+
+        Same forward as tick_chunk (attention + kuramoto + moE on all C positions),
+        but the output head is computed only on the LAST position — the token to
+        predict. This is the CTE-native training mode: the chunk builds context,
+        the prediction is on the final thought state.
+
+        observations: (B, C) token ids. Returns logits: (B, vocab) for the last position.
+        """
+        # Run the full tick_chunk forward (which returns all-position logits),
+        # but we only need the last position. To avoid computing the head on all
+        # positions, we replicate tick_chunk's body but compute the head only
+        # on h[:, -1:, :].
+        # NOTE: we can't call tick_chunk() and slice because that would compute
+        # the head on all 16 positions — defeating the purpose. So we inline the
+        # forward here, stopping before the head.
+        B, C = observations.shape
+        D = self.d_model
+
+        obs_vecs = self.observe(observations)
+        h = obs_vecs.clone()
+        h[:, 0, :] = h[:, 0, :] + self.thought_state[:, 0, :]
+
+        # 1. Attention (vectorized).
+        attn = self.attn
+        nH, dH, nL = attn.n_heads, attn.d_head, attn.n_levels
+        h_normed = self.norm_attn(h)
+        q_all = torch.einsum("bld,de->ble", h_normed, attn.w_qkv[0]) + attn.b_qkv[0]
+        k_all = torch.einsum("bld,de->ble", h_normed, attn.w_qkv[1]) + attn.b_qkv[1]
+        v_all = torch.einsum("bld,de->ble", h_normed, attn.w_qkv[2]) + attn.b_qkv[2]
+        q_all = q_all.view(B, C, nH, dH)
+        k_all = k_all.view(B, C, nH, dH)
+        v_all = v_all.view(B, C, nH, dH)
+        offsets = attn.level_offsets
+        q_lev = q_all.unsqueeze(1) + offsets.view(nL, 1, 1, 1)
+        k_lev = k_all.unsqueeze(1) + offsets.view(nL, 1, 1, 1)
+        q_feat = elu_plus_one(q_lev, alpha=1.0)
+        k_feat = elu_plus_one(k_lev, alpha=1.0)
+        v_lev = v_all.unsqueeze(1).expand(B, nL, C, nH, dH)
+        q_flat = q_feat.permute(0, 1, 3, 2, 4).reshape(B * nL * nH, C, dH)
+        k_flat = k_feat.permute(0, 1, 3, 2, 4).reshape(B * nL * nH, C, dH)
+        v_flat = v_lev.permute(0, 1, 3, 2, 4).reshape(B * nL * nH, C, dH)
+        y_flat = attn._linear_attention_causal_vectorized(q_flat, k_flat, v_flat)
+        y = y_flat.reshape(B, nL, nH, C, dH).permute(0, 1, 3, 2, 4).reshape(B, nL, C, nH * dH)
+        level_weights = torch.softmax(attn.level_logits, dim=-1)
+        attn_out = (y * level_weights.view(1, nL, 1, 1)).sum(dim=1)
+        attn_out = attn_out @ attn.w_out + attn.b_out
+        h = h + attn_out
+
+        # 2. Kuramoto.
+        h_kur = self.norm_kur(h)
+        theta = self.kuramoto._encode_from_hidden(h_kur)
+        theta = theta + 0.1 * self.kuramoto._derivative(theta)
+        theta = torch.remainder(theta, self.kuramoto.TWO_PI)
+        self.kuramoto_phases = theta.detach()
+
+        # 3. MoE.
+        h_moe = self.norm_moe(h)
+        phases_last = theta[:, -1:, :]
+        phases_in = phases_last.expand(-1, C, -1)
+        moe_out, lb_loss = self.moe(h_moe, phases_in)
+        self.last_lb_loss = lb_loss.detach()
+        h = h + moe_out
+
+        # 4. Update thought state.
+        self.thought_state = h[:, -1:, :].detach()
+
+        # 5. Head on LAST position only (the prediction target).
+        last_logits = self.output_head(h[:, -1, :])  # (B, vocab)
+        return last_logits
 
     def think(self, observations: torch.Tensor, max_ticks: int = 10,
               confidence_threshold: float = 0.7) -> torch.Tensor:

@@ -123,11 +123,53 @@ class PersistentMemory:
             self.contexts.pop(min_idx)
             self.importance.pop(min_idx)
 
-    def inject(self, engine, top_k: int = 3):
+    def consolidate_if_salient(
+        self,
+        thought_state: torch.Tensor,
+        salience_score: float,
+        *,
+        context: str = "",
+        importance: float = 0.5,
+        threshold: float = 0.7,
+        min_distance: float = 0.1,
+    ) -> bool:
+        """Consolidate only if salient enough AND not a near-duplicate.
+
+        This gates automatic consolidation by the CTE's salience head: a
+        thought is only written to the memory bank when its salience score
+        clears ``threshold`` and it is not a near-duplicate (cosine >
+        ``1 - min_distance``) of any existing memory.
+
+        Returns:
+            True if a memory was written, False otherwise.
+        """
+        if salience_score < threshold:
+            return False
+        vec = thought_state.flatten().detach().cpu()
+        if vec.shape[0] != self.d_model:
+            return False
+        # De-duplication: skip if too close to an existing memory.
+        if self.vectors:
+            bank = torch.stack(self.vectors)
+            sim = torch.nn.functional.cosine_similarity(
+                vec.unsqueeze(0), bank, dim=-1)
+            if sim.max().item() > 1.0 - min_distance:
+                return False
+        self.consolidate(vec, context=context, importance=importance)
+        return True
+
+    def inject(self, engine, top_k: int = 3, blend: float = 0.05):
         """Inject recalled memories into the engine's thought state.
 
         This is how the engine 'remembers' — past memories are added to
         the current thought, biasing it toward relevant context.
+
+        Args:
+            engine: an object with a (B, 1, d_model) ``thought_state``.
+            top_k: number of memories to recall.
+            blend: fraction of the memory contribution blended in.
+                Default 0.05 (95% current thought + 5% memory) is tuned for
+                continuous per-tick injection rather than one-shot resets.
         """
         if not self.vectors:
             return
@@ -145,10 +187,10 @@ class PersistentMemory:
                 total_weight += weight
             if total_weight > 0:
                 memory_contribution /= total_weight
-                # Blend: 80% current thought + 20% memory.
+                # Blend: (1-blend) current thought + blend memory.
                 engine.thought_state[:, 0, :] = (
-                    0.8 * engine.thought_state[:, 0, :] +
-                    0.2 * memory_contribution.to(engine.thought_state.device)
+                    (1.0 - blend) * engine.thought_state[:, 0, :] +
+                    blend * memory_contribution.to(engine.thought_state.device)
                 )
 
     def save(self, path: str = None):

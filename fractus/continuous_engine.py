@@ -111,6 +111,13 @@ class ContinuousThoughtEngine(nn.Module):
         # 5. Output head: "what do I want to say?"
         self.output_head = nn.Linear(d_model, vocab_size, bias=False)
 
+        # 6. Salience head: "is this thought worth remembering?" (for PersistentMemory)
+        self.salience_head = nn.Linear(d_model, 1)
+
+        # 7. Optional persistent memory (attached via attach_memory()).
+        self.memory = None
+        self.memory_active = True
+
         # Initialize the thought state (will be set by reset_thought).
         self.register_buffer("thought_state", torch.zeros(1, 1, d_model))
         self.register_buffer("attn_S", torch.zeros(1, n_heads * d_head, n_heads * d_head))
@@ -127,6 +134,14 @@ class ContinuousThoughtEngine(nn.Module):
         self.kuramoto_phases = torch.zeros(
             batch_size, 1, self.kuramoto.N, device=self.thought_state.device
         )
+
+    def attach_memory(self, memory):
+        """Attach a PersistentMemory bank. Memory injection activates on tick."""
+        self.memory = memory
+
+    def detach_memory(self):
+        """Detach the memory bank."""
+        self.memory = None
 
     def tick(self, observation: torch.Tensor = None) -> tuple:
         """Advance the thought by ONE tick.

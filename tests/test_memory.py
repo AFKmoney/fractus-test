@@ -90,3 +90,30 @@ def test_memory_consolidate_if_salient_dedup():
                                        min_distance=0.1)
     assert wrote is True
     assert len(mem) == 2
+
+
+def test_cte_has_salience_head_and_memory_slot():
+    from fractus.continuous_engine import ContinuousThoughtEngine
+    eng = ContinuousThoughtEngine(
+        vocab_size=50257, d_model=128, n_heads=2, d_head=64, n_levels=2,
+        n_oscillators=8, coupling_rank=4, n_experts=4, top_k=2,
+        expert_d_ff=128, siren_rank=32,
+    )
+    assert hasattr(eng, "salience_head")
+    assert hasattr(eng, "memory")
+    assert eng.memory is None
+    assert eng.memory_active is True
+
+
+def test_cte_attach_detach_memory():
+    from fractus.continuous_engine import ContinuousThoughtEngine
+    eng = ContinuousThoughtEngine(
+        vocab_size=50257, d_model=128, n_heads=2, d_head=64, n_levels=2,
+        n_oscillators=8, coupling_rank=4, n_experts=4, top_k=2,
+        expert_d_ff=128, siren_rank=32,
+    )
+    mem = PersistentMemory(d_model=128, max_memories=10)
+    eng.attach_memory(mem)
+    assert eng.memory is mem
+    eng.detach_memory()
+    assert eng.memory is None

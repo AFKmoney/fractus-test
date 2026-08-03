@@ -158,11 +158,18 @@ class PersistentMemory:
         self.consolidate(vec, context=context, importance=importance)
         return True
 
-    def inject(self, engine, top_k: int = 3, blend: float = 0.05):
+    def inject(self, engine, top_k: int = 3, blend: float = 0.05) -> float:
         """Inject recalled memories into the engine's thought state.
 
         This is how the engine 'remembers' — past memories are added to
         the current thought, biasing it toward relevant context.
+
+        Returns:
+            The L2 norm of the perturbation caused by the injection
+            (``||h_after - h_before||``). Zero if no memories were recalled.
+            This is the intrinsic salience signal for the salience head: a
+            large perturbation means the memory was relevant to the current
+            thought state.
 
         Args:
             engine: an object with a (B, 1, d_model) ``thought_state``.
@@ -172,7 +179,7 @@ class PersistentMemory:
                 continuous per-tick injection rather than one-shot resets.
         """
         if not self.vectors:
-            return
+            return 0.0
 
         thought = engine.thought_state.flatten()  # (d_model,)
         recalled = self.recall(thought, top_k=top_k)
@@ -187,11 +194,17 @@ class PersistentMemory:
                 total_weight += weight
             if total_weight > 0:
                 memory_contribution /= total_weight
+                # Measure the perturbation BEFORE applying it.
+                # Δ = blend * memory_contribution (the additive part that shifts the thought).
+                delta = blend * memory_contribution.to(engine.thought_state.device)
+                perturbation = delta.norm().item()  # L2 norm of the shift
                 # Blend: (1-blend) current thought + blend memory.
                 engine.thought_state[:, 0, :] = (
                     (1.0 - blend) * engine.thought_state[:, 0, :] +
                     blend * memory_contribution.to(engine.thought_state.device)
                 )
+                return perturbation
+        return 0.0
 
     def save(self, path: str = None):
         """Save the memory bank to disk."""

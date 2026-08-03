@@ -220,15 +220,44 @@ class ContinuousThoughtEngine(nn.Module):
         self.last_lb_loss = lb_loss.detach()
         h = h + moe_out
 
-        # 4. Update thought state.
-        self.thought_state = h.detach()
+        # 4. Update thought state (clone, not detach-view, so inject's in-place
+        #    modification of thought_state doesn't corrupt h's autograd graph).
+        self.thought_state = h.detach().clone()
 
         # 3b. Memory: salience-gated consolidation + continuous injection.
+        # The salience head learns to predict how much the memory injection
+        # will perturb the thought state. This is an intrinsic signal from
+        # the dynamical system, not an external label.
+        #
+        # IMPORTANT: salience_loss is computed from the PREVIOUS tick's
+        # perturbation (one-tick delay). This is because inject() modifies
+        # thought_state in-place, which would break autograd if we tried to
+        # backpropagate through the same tick's h after inject. The one-tick
+        # delay is natural for a dynamical system: the head predicts the
+        # perturbation its current state will cause, and the target is the
+        # perturbation that was actually measured on the previous tick.
         if self.memory is not None and self.memory_active:
             salience = torch.sigmoid(self.salience_head(h[:, 0, :]))  # (B, 1)
+
+            # Compute salience_loss from the PREVIOUS tick's perturbation target.
+            if not hasattr(self, '_pert_max'):
+                self._pert_max = 1.0
+            if not hasattr(self, '_prev_pert_target'):
+                self._prev_pert_target = 0.0
+            import torch as _t
+            self.last_salience_loss = _t.nn.functional.binary_cross_entropy(
+                salience[0:1, 0], _t.tensor([self._prev_pert_target]))
+
+            # NOW do consolidation + injection (side-effects, no grad needed).
             self.memory.consolidate_if_salient(
                 h[0:1, 0, :], salience[0].item())
-            self.memory.inject(self, blend=0.05, top_k=3)
+            perturbation = self.memory.inject(self, blend=0.05, top_k=3)
+            # Update running max + store target for NEXT tick.
+            if perturbation > self._pert_max:
+                self._pert_max = perturbation
+            self._prev_pert_target = min(perturbation / max(self._pert_max, 1e-8), 1.0)
+        else:
+            self.last_salience_loss = torch.tensor(0.0)
 
         # 5. Confidence + output.
         confidence = torch.sigmoid(self.confidence_head(h[:, 0, :]).squeeze(-1))  # (B,)

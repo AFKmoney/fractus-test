@@ -224,6 +224,8 @@
   <div class="stats">
     <div>Memories stored: <span class="memories-count" id="count">…</span></div>
     <div><a onclick="showMemories()">[ view shared memories ]</a></div>
+    <div>Thought memories: <span class="memories-count" id="pmcount">…</span></div>
+    <div><a onclick="showPMemories()">[ view thought memories ]</a></div>
   </div>
 
   <footer>
@@ -301,6 +303,8 @@ async function refreshStats() {
     const r = await fetch('/stats');
     const d = await r.json();
     countEl.textContent = d.memories;
+    const pmEl = document.getElementById('pmcount');
+    if (pmEl && d.pmemories !== undefined) pmEl.textContent = d.pmemories;
   } catch {}
 }
 
@@ -315,6 +319,24 @@ async function showMemories() {
     });
   } catch (e) {
     addMsg('(could not load memories)', null, true);
+  }
+}
+
+async function showPMemories() {
+  try {
+    const r = await fetch('/pmemories?limit=10');
+    const d = await r.json();
+    addMsg(`— Thought memories / subconscious (${d.count}/${d.max}) —`, null, true);
+    if (!d.recent || d.recent.length === 0) {
+      addMsg('(no thought memories yet — talk to Fractus first)', null, true);
+    } else {
+      d.recent.forEach(m => {
+        const imp = m.importance !== undefined ? ` (imp=${m.importance})` : '';
+        addMsg(`◆ ${m.context}${imp}`, null, true);
+      });
+    }
+  } catch (e) {
+    addMsg('(could not load thought memories)', null, true);
   }
 }
 

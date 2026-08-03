@@ -41,6 +41,7 @@ def get_engine():
             from fractus.continuous_engine import ContinuousThoughtEngine
             from fractus.tokenizer import FractusTokenizer
             from fractus.rag import KnowledgeBase, RAGEngine
+            from fractus.memory import PersistentMemory
 
             tok = FractusTokenizer.gpt2_compatible()
             engine = ContinuousThoughtEngine(
@@ -74,7 +75,25 @@ def get_engine():
                     print(f"[Fractus] KB load failed: {e}", flush=True)
 
             rag = RAGEngine(engine, tok, kb)
-            _engine = {"engine": engine, "tok": tok, "kb": kb, "rag": rag}
+
+            # --- PersistentMemory: thought-state cross-session memory (the "subconscious") ---
+            # Attached to the CTE. Salience head bias forced high so the engine
+            # consolidates most thoughts (untrained — we want visible memory for the demo).
+            import torch as _torch
+            with _torch.no_grad():
+                engine.salience_head.bias.fill_(3.0)  # sigmoid(3) ≈ 0.95 → consolidates most thoughts
+            pm_path = os.environ.get("FRACTUS_PM_PATH", "/data/fractus_pm.pt")
+            pm = PersistentMemory(d_model=128, max_memories=256, path=pm_path)
+            if os.path.exists(pm_path):
+                try:
+                    pm.load(pm_path)
+                    print(f"[Fractus] Loaded PersistentMemory: {len(pm)} memories", flush=True)
+                except Exception as e:
+                    print(f"[Fractus] PM load failed: {e}", flush=True)
+            engine.attach_memory(pm)
+            print(f"[Fractus] PersistentMemory attached (salience bias=3.0, blend=0.05)", flush=True)
+
+            _engine = {"engine": engine, "tok": tok, "kb": kb, "rag": rag, "pm": pm}
         return _engine
 
 
@@ -114,15 +133,19 @@ def moderate(text: str) -> tuple:
 
 
 def save_kb_async():
-    """Persist the KB in a background thread (don't block the response)."""
+    """Persist the KB + PM in a background thread (don't block the response)."""
     def _save():
         try:
             e = get_engine()
             kb_path = os.environ.get("FRACTUS_KB_PATH", "/data/fractus_kb.pkl")
             os.makedirs(os.path.dirname(kb_path) or ".", exist_ok=True)
             e["kb"].save(kb_path)
+            # Also persist the PersistentMemory (thought-state memories).
+            pm_path = os.environ.get("FRACTUS_PM_PATH", "/data/fractus_pm.pt")
+            os.makedirs(os.path.dirname(pm_path) or ".", exist_ok=True)
+            e["pm"].save(pm_path)
         except Exception as ex:
-            print(f"[Fractus] KB save failed: {ex}", flush=True)
+            print(f"[Fractus] KB/PM save failed: {ex}", flush=True)
     threading.Thread(target=_save, daemon=True).start()
 
 
@@ -209,6 +232,25 @@ async def memories(limit: int = 20):
         return {"error": str(ex), "count": 0, "recent": []}
 
 
+@app.get("/pmemories")
+async def pmemories(limit: int = 20):
+    """Show the PersistentMemory's thought-state memories (the 'subconscious')."""
+    try:
+        e = get_engine()
+        pm = e["pm"]
+        n = len(pm)
+        # Return recent context labels + importance.
+        recent = []
+        ctxs = pm.contexts[-limit:] if pm.contexts else []
+        imps = pm.importance[-limit:] if pm.importance else []
+        for i in range(min(len(ctxs), limit)):
+            recent.append({"context": ctxs[i][:200] if ctxs[i] else "(unlabeled)",
+                           "importance": round(imps[i], 3) if i < len(imps) else 0.5})
+        return {"count": n, "max": pm.max_memories, "recent": list(reversed(recent))}
+    except Exception as ex:
+        return {"error": str(ex), "count": 0, "recent": []}
+
+
 @app.get("/stats")
 async def stats():
     """Live stats for the UI."""
@@ -216,6 +258,7 @@ async def stats():
         e = get_engine()
         return {
             "memories": len(e["kb"].texts),
+            "pmemories": len(e["pm"]),
             "engine": "Fractus-CTE",
             "status": "online",
         }

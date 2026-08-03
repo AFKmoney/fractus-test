@@ -134,6 +134,49 @@ class ContinuousThoughtEngine(nn.Module):
         self.kuramoto_phases = torch.zeros(
             batch_size, 1, self.kuramoto.N, device=self.thought_state.device
         )
+        # Self-modification counters (auto-grow tracking).
+        self._tick_count = getattr(self, '_tick_count', 0)
+        self._expert_hits = getattr(self, '_expert_hits',
+                                    torch.zeros(self.moe.n_experts))
+
+    def maybe_grow(self, *, min_ticks_between_grows: int = 1000,
+                   max_experts: int = 32, imbalance_threshold: float = 0.8) -> bool:
+        """Check if the model should grow a new expert (self-modification).
+
+        The model grows when the routing is severely imbalanced — one expert
+        dominates while others are starved — signaling that the model lacks
+        capacity in that region of the phase space. The new expert is placed
+        at the midpoint of the largest phase gap.
+
+        Args:
+            min_ticks_between_grows: cooldown to avoid runaway growth.
+            max_experts: hard cap on expert count.
+            imbalance_threshold: fraction of ticks where the top expert
+                                 must dominate to trigger growth.
+        Returns:
+            True if a new expert was added, False otherwise.
+        """
+        if self.moe.n_experts >= max_experts:
+            return False
+        if self._tick_count - getattr(self, '_last_grow_tick', 0) < min_ticks_between_grows:
+            return False
+        if self._expert_hits.numel() != self.moe.n_experts:
+            self._expert_hits = torch.zeros(self.moe.n_experts)
+            return False
+        total = self._expert_hits.sum().item()
+        if total < self.moe.n_experts * 10:
+            return False  # not enough data yet
+        # Check imbalance: is the top expert dominating?
+        dominance = self._expert_hits.max().item() / max(total, 1)
+        if dominance < imbalance_threshold:
+            return False
+        # Grow!
+        new_idx = self.moe.add_expert()
+        self._last_grow_tick = self._tick_count
+        self._expert_hits = torch.zeros(self.moe.n_experts)
+        print(f"[Fractus] Self-modified: grew expert {new_idx} "
+              f"(now {self.moe.n_experts} experts, dominance was {dominance:.2f})", flush=True)
+        return True
 
     def attach_memory(self, memory):
         """Attach a PersistentMemory bank. Memory injection activates on tick."""
@@ -218,6 +261,14 @@ class ContinuousThoughtEngine(nn.Module):
         phases_in = theta[:, 0:1, :]                     # (B, 1, n_oscillators)
         moe_out, lb_loss = self.moe(h_moe, phases_in)    # moe_out: (B, 1, d_model)
         self.last_lb_loss = lb_loss.detach()
+        # Track routing hits for self-modification (maybe_grow).
+        self._tick_count = getattr(self, '_tick_count', 0) + 1
+        if hasattr(self, '_expert_hits') and self._expert_hits.numel() == self.moe.n_experts:
+            with torch.no_grad():
+                gates = self.moe._compute_gates(phases_in)  # (B, 1, E)
+                topk_idx = gates.topk(self.moe.top_k, dim=-1).indices
+                for e in range(self.moe.n_experts):
+                    self._expert_hits[e] += (topk_idx == e).sum().item()
         h = h + moe_out
 
         # 4. Update thought state (clone, not detach-view, so inject's in-place

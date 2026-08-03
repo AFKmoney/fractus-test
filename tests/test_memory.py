@@ -117,3 +117,73 @@ def test_cte_attach_detach_memory():
     assert eng.memory is mem
     eng.detach_memory()
     assert eng.memory is None
+
+
+def test_cte_salience_head_outputs_in_range():
+    from fractus.continuous_engine import ContinuousThoughtEngine
+    eng = ContinuousThoughtEngine(
+        vocab_size=50257, d_model=128, n_heads=2, d_head=64, n_levels=2,
+        n_oscillators=8, coupling_rank=4, n_experts=4, top_k=2,
+        expert_d_ff=128, siren_rank=32,
+    )
+    eng.reset_thought(batch_size=1)
+    obs = torch.tensor([42], dtype=torch.long)
+    eng.tick(obs)
+    # salience_head output is captured during tick; we check via a direct call.
+    with torch.no_grad():
+        score = torch.sigmoid(eng.salience_head(eng.thought_state[:, 0, :]))
+    assert 0.0 <= score.item() <= 1.0
+
+
+def test_cte_consolidates_when_salient():
+    from fractus.continuous_engine import ContinuousThoughtEngine
+    eng = ContinuousThoughtEngine(
+        vocab_size=50257, d_model=128, n_heads=2, d_head=64, n_levels=2,
+        n_oscillators=8, coupling_rank=4, n_experts=4, top_k=2,
+        expert_d_ff=128, siren_rank=32,
+    )
+    # Force salience_head to output ~1.0 (set bias high).
+    with torch.no_grad():
+        eng.salience_head.bias.fill_(10.0)
+    mem = PersistentMemory(d_model=128, max_memories=10)
+    eng.attach_memory(mem)
+    eng.reset_thought(batch_size=1)
+    obs = torch.tensor([42], dtype=torch.long)
+    eng.tick(obs)
+    assert len(mem) > 0, "should have consolidated a salient thought"
+
+
+def test_cte_skips_consolidate_when_not_salient():
+    from fractus.continuous_engine import ContinuousThoughtEngine
+    eng = ContinuousThoughtEngine(
+        vocab_size=50257, d_model=128, n_heads=2, d_head=64, n_levels=2,
+        n_oscillators=8, coupling_rank=4, n_experts=4, top_k=2,
+        expert_d_ff=128, siren_rank=32,
+    )
+    # Force salience_head to output ~0.0 (set bias very negative).
+    with torch.no_grad():
+        eng.salience_head.bias.fill_(-10.0)
+    mem = PersistentMemory(d_model=128, max_memories=10)
+    eng.attach_memory(mem)
+    eng.reset_thought(batch_size=1)
+    obs = torch.tensor([42], dtype=torch.long)
+    eng.tick(obs)
+    assert len(mem) == 0, "should NOT have consolidated a non-salient thought"
+
+
+def test_cte_memory_active_toggle():
+    from fractus.continuous_engine import ContinuousThoughtEngine
+    eng = ContinuousThoughtEngine(
+        vocab_size=50257, d_model=128, n_heads=2, d_head=64, n_levels=2,
+        n_oscillators=8, coupling_rank=4, n_experts=4, top_k=2,
+        expert_d_ff=128, siren_rank=32,
+    )
+    with torch.no_grad():
+        eng.salience_head.bias.fill_(10.0)  # salient
+    mem = PersistentMemory(d_model=128, max_memories=10)
+    eng.attach_memory(mem)
+    eng.memory_active = False  # disabled
+    eng.reset_thought(batch_size=1)
+    obs = torch.tensor([42], dtype=torch.long)
+    eng.tick(obs)
+    assert len(mem) == 0, "memory_active=False should prevent consolidation"

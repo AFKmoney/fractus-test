@@ -223,6 +223,13 @@ class ContinuousThoughtEngine(nn.Module):
         # 4. Update thought state.
         self.thought_state = h.detach()
 
+        # 3b. Memory: salience-gated consolidation + continuous injection.
+        if self.memory is not None and self.memory_active:
+            salience = torch.sigmoid(self.salience_head(h[:, 0, :]))  # (B, 1)
+            self.memory.consolidate_if_salient(
+                h[0:1, 0, :], salience[0].item())
+            self.memory.inject(self, blend=0.05, top_k=3)
+
         # 5. Confidence + output.
         confidence = torch.sigmoid(self.confidence_head(h[:, 0, :]).squeeze(-1))  # (B,)
         output_logits = self.output_head(h[:, 0, :])  # (B, vocab)

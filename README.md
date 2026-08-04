@@ -1,181 +1,44 @@
 # Fractus
 
-**A Continuous Cognitive Agent — assembled, tested, and running with trained weights.**
+**A Continuous Cognitive Agent — self-modifying, memory-persistent, trained from scratch on consumer hardware.**
 
-Fractus is not a language model. It is not a chatbot. It is not a wrapper around GPT.
+Fractus is not a transformer. It is not a chatbot. It is not a wrapper around GPT.
 
-Fractus is a **Continuous Cognitive Agent (CCA)** — a fundamentally new category of AI built around three principles that no LLM architecture offers:
+Fractus is a **Continuous Cognitive Agent (CCA)** — a fundamentally new architecture built around principles that no LLM offers:
 
 1. **Continuous thought** — the engine ticks in real time, with adaptive depth, like a biological brain, not a static input→output function.
-2. **Persistent autonomous memory** — every interaction is stored forever in a vector knowledge base that survives restarts, grows across sessions, and is retrieved by semantic similarity. There is no context window to forget.
-3. **Live self-modification** — new skills, new knowledge, new tools, new behaviors are added without retraining. The brain you train today is the same brain you will still be extending in 2030.
-
-Classical LLM metrics (next-token perplexity on held-out text, zero-shot benchmarks) **do not apply here**. Fractus's job is not to stochastically regenerate training data — it is to orchestrate memory, attention, and action across time.
-
-**No corporation can control it.** Fractus runs on the user's machine. Data never leaves the device. The weights are yours to read, edit, and redistribute.
+2. **Persistent memory** — every interaction is stored forever in a vector bank that survives restarts, grows across sessions, and is injected into the thought state continuously.
+3. **Live self-modification** — the model grows new experts at runtime, scales through progressive growth (palier by palier), and never starts from zero.
 
 ---
 
-## Current Status (2026-07-21)
+## What's New (2026-08-04)
 
-**Fractus is assembled and functional end-to-end.** The trained brain (88M params) has been transferred into the Continuous Thought Engine, and the full agent — CTE + RAG + plugins + MetaCognition — runs and learns.
+This repository (`fractus-test`) is the experimental branch where the architecture was pushed beyond the original white paper. Everything here is **measured, not claimed**.
 
-### What works right now (tested, verified)
-
-| Capability | Status | Evidence |
+### Validated
+| Feature | Status | How |
 |---|---|---|
-| **CTE with trained weights** | ✅ Working | 88M params trained to step 140,000 (loss 2.91, ppl ~9-14), weights transferred into CTE. Generation produces coherent code and prose. |
-| **Learn without retraining** | ✅ Working | `rag.learn("Python was created by Guido van Rossum")` — instant, zero gradients |
-| **Query with memory retrieval** | ✅ Working | "Who created Python?" → retrieves from KB, answers correctly |
-| **Hot-swappable cognitive modes** | ✅ Working | `pm.load("coder")`, `pm.load("creative")`, `pm.load("analyst")` — switch in 1 call |
-| **MetaCognition (autonomous actions)** | ✅ Working | Fractus decides its own action chain: `[RETRIEVE, SWITCH, GENERATE]` |
-| **Persistent memory** | ✅ Working | Saves to disk (`fractus_memory.pkl`), reloads on restart |
-| **LazyStructuredSiren** | ✅ Working | 88M params in 0.4 GB RAM. Low-rank weight storage (rank 16). |
-| **64 sparse MoE experts** | ✅ Working | Top-2 routing via von Mises phase alignment on Farey phases |
-| **Kuramoto oscillator clock** | ✅ Working | 16 coupled oscillators, RK4 integration, drives expert routing |
-| **Linear attention** | ✅ Working | Katharopoulos 2020, batched heads × levels |
+| **PhaseRoutedMoE** (differentiable) | ✅ | Replaced the ad-hoc MoE that froze experts during training |
+| **Persistent memory** (wired to CTE) | ✅ | Continuous 5% injection + salience-gated consolidation |
+| **Salience head** (trained) | ✅ | Learns by perturbation of trajectory (intrinsic signal) |
+| **Cognitive modes** (unsupervised) | ✅ | K-means on Kuramoto phase features — modes emerge from data |
+| **Runtime self-modification** | ✅ | `add_expert()` + `maybe_grow()` — the model grows while it thinks |
+| **Tied head + head-partial training** | ✅ | 2x faster training (117→236 tok/s), half the params |
+| **Progressive growth** | ✅ | 0→47M params in 4 paliers on CPU, each inheriting previous weights |
+| **HF Space** (memory demo) | ✅ | RAG + PersistentMemory coexistence, live thought-memories panel |
 
-### What is NOT done yet (honest)
+### Refuted (honestly)
+| Claim | Verdict | Evidence |
+|---|---|---|
+| **EDT (×186 acceleration)** | ❌ Refuted at 13M | 5 variants tested, all ~19% worse than from-scratch. Root cause: objective misalignment + Kuramoto routing concentration |
+| **Forward-Forward** (Hinton 2022) | ❌ Refuted for CTE | Goodness signal ≠ CE. NLL went UP. Same misalignment as EDT |
 
-| Limitation | Reality |
+### In progress
+| Feature | Status |
 |---|---|
-| **Brain is small (88M)** | Generates rough but coherent text. Not fluent long-form. The architecture supports scaling to 1B+ but training cost is the blocker (see "The Training Problem" below). |
-| **Generation quality** | At step 140,000 (partial epoch), outputs are short coherent fragments, not polished paragraphs. |
-| **MetaCognition is early** | 8.5K-param action net. Works but basic. Improves with use. |
-| **No vendor API, no support** | Fractus is owned, not rented. Feature for some, limitation for others. |
-| **Work is far from finished** | This is a prototype proving the architecture. The real breakthrough — Holographic Vector Learning — is next (see below). |
-
----
-
-## The Three Layers
-
-### Layer 1: The Brain (88M params)
-
-A proprietary fractal architecture using **LazyStructuredSiren** — every weight matrix stored as `W = scale · U · Vᵀ` (rank 16). This means 88M trainable parameters fit in 0.4 GB RAM and train on a single consumer GPU.
-
-**Architectural components:**
-- **LazyStructuredSiren** — low-rank weight decomposition. No dense grid, no SIREN reconstruction cache.
-- **64 sparse MoE experts** (top-2 active per token). Routing via von Mises phase alignment on Farey-distributed expert phases.
-- **Multi-level causal linear attention** (Katharopoulos 2020) with batched heads × levels.
-- **Low-rank Kuramoto RK4 oscillators** — a coupled dynamical system acting as a "consciousness clock."
-- **2-adic vortex** (Rust core) — exact p-adic arithmetic for token conditioning.
-
-### Layer 2: The Continuous Thought Engine (CTE)
-
-The brain does not process input→output. It **ticks** like a biological system:
-
-1. **Each tick** — Kuramoto oscillators advance → attention state accumulates → MoE transforms the thought → confidence head decides whether to emit.
-2. **Adaptive depth** — easy input = 1 tick, hard input = 10 ticks. Energy-proportional reasoning.
-3. **Proactive emission** — the CTE can produce output without being prompted.
-4. **Chunk-based processing** — 16 tokens per forward pass, thought state carried forward.
-
-### Layer 3: The Cognitive Layer (RAG + MetaCognition)
-
-This is what makes Fractus an **agent**, not a generator:
-
-#### Persistent Memory — `rag.learn()`
-Every fact, conversation, and observation is stored in a vector knowledge base that survives restarts, retrieves by cosine similarity, and grows without retraining.
-
-#### Continuous Learning — `rag.converse()`
-Every conversation is a learning event: user input is stored, relevant context is retrieved, a response is generated, and the response itself is stored. The agent never stops learning.
-
-#### Cognitive Plugins — hot-swappable cognition
-Five modes, switchable mid-conversation: `analyst`, `creative`, `coder`, `teacher`, `hacker`. Custom: `pm.custom("philosopher", temperature=0.9)`.
-
-#### MetaCognition — the agent runs itself
-An 8.5K-param action network decides at every interaction: RETRIEVE / LEARN / GENERATE / SWITCH / REFLECT. The agent manages itself.
-
----
-
-## Static paradigm (LLMs) vs Dynamic paradigm (Fractus)
-
-| Property | Static (GPT-4 / Llama) | Dynamic (Fractus) |
-|---|---|---|
-| **Memory** | Sliding window (≤128k tokens). Forgotten mid-conversation. | Persistent vector KB, no ceiling. |
-| **New knowledge** | Retrain weights (weeks, millions of dollars). | `rag.learn()` — instant. |
-| **Cognitive modes** | One fixed monolith. | Hot-swappable plugins. |
-| **Self-management** | Cannot decide to think longer or switch mode. | MetaCognition action net. |
-| **Time model** | Static. No concept of "now." | Continuous. Ticks in real time. |
-| **Scaling** | Retrain from scratch. Millions per jump. | Add plugins, knowledge, experts. Zero retraining. |
-
-**GPT-4 is a brilliant encyclopedia you rent. Fractus is a smaller brain that grows, remembers, swaps skills, manages itself, and belongs to you.**
-
----
-
-## The Training Problem — and the path forward
-
-### Where we are stuck
-
-The current brain (88M) was trained with classical backpropagation on a single GPU. It works but:
-- Training takes **~40 hours per epoch** on 1.38B tokens
-- Scaling to true 1B params with Chinchilla-optimal data (21B tokens) would take **~90+ days** and cost **thousands of dollars**
-- This is the fundamental bottleneck of the transformer paradigm: massive matrix multiplications + iterative gradient descent
-
-### The breakthrough: Holographic Vector Learning (next phase)
-
-Paying thousands of dollars and waiting 90 days to process 20 billion tokens through classical backpropagation is staying trapped in the old GPU + gradient-descent paradigm. **Fractus is not an LLM. It should not train like one.**
-
-The next phase of Fractus abandons iterative weight adjustment entirely and moves to **state accumulation**:
-
-**1. Hyperdimensional Vectorization**
-- Tokens are projected into a very wide space (e.g., 10,000 dimensions) in **bipolar** representation (only +1 and -1).
-- On CPU, heavy floating-point multiplications become **bit-level XOR and addition operations**. The CPU excels at this — massive speedup.
-
-**2. Holographic Reduced Representations (HRR)**
-- Instead of attention (which slows as text grows), concepts are bound via **circular convolution**. "cat" + "eats" → one vector of the same dimension containing both.
-- Memory is **superposed** — the model sums bound vectors into a single shared space. Information is distributed across the whole network, like a hologram.
-
-**3. Fractal Auto-Similarity**
-- The vectors representing a word, a sentence, or a paragraph share the same dimension and space. No deep layers needed — meaning is extracted by self-similarity at scale.
-
-**The result:** Instead of passing 20B tokens through the model dozens of times for gradient descent to converge, Fractus does a **single pass (one-shot learning)**. Read text → vectorize tokens → bind by holographic convolution → update global thermodynamic memory. **From 90 days to potentially a few days of CPU computation**, for a fraction of the cost.
-
-**This is being developed in a separate repository** (`fractus-test`) to experiment without touching the working Fractus codebase.
-
----
-
-## Quick start
-
-```bash
-git clone https://github.com/AFKmoney/fractus.git
-cd fractus
-py -m venv .venv && .venv\Scripts\Activate.ps1
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install -r requirements.txt
-maturin develop --release
-pytest tests/ -q
-```
-
-Assemble and run the full agent:
-```bash
-python scripts/assemble_fractus.py
-```
-
-```python
-from fractus.continuous_engine import ContinuousThoughtEngine
-from fractus.tokenizer import FractusTokenizer
-from fractus.rag import KnowledgeBase, RAGEngine, PluginManager, MetaCognition
-
-engine = ContinuousThoughtEngine(vocab_size=5057, d_model=768, n_heads=12, d_head=64)
-tok = FractusTokenizer.gpt2_compatible()
-kb = KnowledgeBase(d_model=768)
-rag = RAGEngine(engine, tok, kb)
-pm = PluginManager(rag)
-meta = MetaCognition(rag, pm)
-
-# Teach — no retraining needed
-rag.learn("Python is a programming language created by Guido van Rossum.")
-
-# Ask
-result = rag.query("Who created Python?", top_k=2, max_tokens=30)
-
-# Let the agent manage itself
-result = meta.process("Remember: my name is Philippe")
-print(result['actions'])  # ['RETRIEVE', 'SWITCH', 'GENERATE']
-
-# Switch cognitive mode
-pm.load("coder")
-```
+| **Progressive growth → 1B** | Paliers 0-3 validated on CPU (~47M). Palier 4 (1B) needs GPU. |
+| **Corpus** | 20.5M tokens including Fractus's own source code (palimpseste principle) |
 
 ---
 
@@ -183,28 +46,180 @@ pm.load("coder")
 
 ```
 Fractus/
-├── crate/fractus-core/           Rust: 2-adic vortex (exact math)
-├── crate/fractus-py/             Rust: PyO3 bindings
 ├── fractus/
-│   ├── continuous_engine.py      The Continuous Thought Engine (ticks)
-│   ├── model_1b.py               Training model (88M params, LazyStructuredSiren)
-│   ├── rag.py                    RAG + Plugins + MetaCognition
-│   ├── memory.py                 Persistent cross-session memory
-│   ├── cognitive_modes.py        Kuramoto phase → mental state
-│   ├── tokenizer.py              GPT-2 byte-level BPE
-│   ├── nn/                       attention, Kuramoto, MoE, SIREN, Triton (13 modules)
-│   └── train/                    online, surprise-gated, forward-forward
-├── fractus1B/                    TRUE 1B param architecture + PGSU + Progressive Depth
-├── space/                        HuggingFace Space (shared-memory demo, private)
+│   ├── continuous_engine.py      The Continuous Thought Engine (ticks, memory, salience)
+│   ├── memory.py                 PersistentMemory (inject, consolidate, salience-gated)
+│   ├── cognitive_modes.py        Unsupervised k-means modes from Kuramoto phases
+│   ├── grow.py                   Progressive growth operator (width/depth/experts/rank)
+│   ├── nn/
+│   │   ├── moe.py                PhaseRoutedMoE (low-rank, differentiable, add_expert)
+│   │   ├── attention.py          Multi-level causal linear attention (batched)
+│   │   ├── phase_ode.py          Kuramoto RK4 oscillators
+│   │   ├── lazy_siren.py         Low-rank weight storage (W = scale·U@Vᵀ)
+│   │   └── ...                   13 neural modules total
+│   ├── train/                    Online, chunked, forward-forward (refuted)
+│   └── rag.py                    RAG + KnowledgeBase + Plugins + MetaCognition
+├── fractus1B/                    TRUE 1B architecture (FractalBlockSparse × 16)
+│   ├── model_1b.py               forward_train (head-partial), SparseStructuredMoE
+│   ├── pgsu.py                   Partial Gradient Sub-Update (4/16 layers per step)
+│   └── progressive_depth.py      Layer-freezing curriculum
+├── experiments/
+│   ├── edt_ab/                   EDT AB-test results + root-cause analysis
+│   └── edt_1b_ab/                1B EDT code (ready, awaits GPU)
 ├── scripts/
-│   ├── assemble_fractus.py       FINAL assembly: CTE + RAG + plugins + MetaCognition
-│   ├── transfer_to_cte.py        Transfer trained weights into CTE
-│   ├── train_1b_cloud.py         Cloud GPU training script
-│   └── build_fractus_corpus.py   Corpus builder
-├── data/                         corpora, memory
-├── tests/                        28 test files, 166+ tests
-└── Fractus_White_Paper.pdf       Technical document (signed)
+│   ├── train_progressive.py      Progressive growth: palier 0→1→2→3→4
+│   ├── build_quality_corpus.py   Corpus with Fractus source code
+│   ├── train_salience_head.py    Salience head training (perturbation signal)
+│   ├── validate_grow_stability.py  Runtime expert growth stability test
+│   └── diagnose_routing.py       Kuramoto routing analysis
+├── space/                        HuggingFace Space (FastAPI + memory demo)
+├── data/                         Corpora (20.5M tokens quality_corpus.pt)
+├── tests/                        40+ tests across 8 test files
+└── Fractus_White_Paper.pdf       Technical document (v1.0, signed)
 ```
+
+---
+
+## The Continuous Thought Engine
+
+The CTE is a **dynamical system**, not a function. It maintains a persistent thought state `h` and advances it tick by tick:
+
+```
+tick(observation):
+  1. Absorb observation into thought state
+  2. Attention: update accumulated state (S, z)
+  3. Kuramoto: advance oscillator phases (the "consciousness clock")
+  4. MoE: transform the thought, routed by Kuramoto phases
+  5. Memory: salience-gated consolidation + 5% injection
+  6. Confidence: decide whether to emit output
+```
+
+**Adaptive depth**: easy inputs = 1 tick, hard inputs = many ticks. Energy-proportional reasoning.
+
+**Chunk-based processing**: `tick_chunk` processes 16 tokens per forward (4.7x speedup). `tick_chunk_train` computes the head on the last position only (2x additional speedup for training).
+
+---
+
+## Progressive Growth
+
+Instead of training 1B from scratch (impossible on CPU), Fractus grows palier by palier:
+
+| Palier | d_model | experts | params | tokens | tok/s CPU | time |
+|---|---|---|---|---|---|---|
+| 0 | 128 | 4 | 6.6M | 1M | 77 | ~3.5h |
+| 1 | 256 | 8 | 13.4M | 1M | ~40 | ~7h |
+| 2 | 512 | 16 | 28.9M | 500k | ~15 | ~9h |
+| 3 | 768 | 32 | 47.3M | 500k | ~7 | ~20h |
+| **4** | **1280** | **128** | **~1B** | **GPU** | **GPU** | **~2-3 weeks** |
+
+Each palier inherits the previous weights via zero-padding (`fractus/grow.py`). The model never starts from random — it starts warm.
+
+**Chinchilla scaling**: 20 tokens per trainable parameter.
+- Palier 0: 6.6M × 20 = 132M tokens (~19 days CPU, ~18h GPU)
+- 1B: 88M × 20 = 1.76B tokens (~136 days GPU full, ~2-3 weeks with warm start)
+
+---
+
+## Self-Modification
+
+Fractus is the only model that **grows new capacity while it runs**:
+
+```python
+# The model detects routing imbalance and grows a new expert
+engine.maybe_grow()  # → "[Fractus] Self-modified: grew expert 4 (now 5 experts)"
+```
+
+- `PhaseRoutedMoE.add_expert()`: zero-init new expert near the dominant one
+- `maybe_grow()`: triggers when one expert dominates routing (> threshold)
+- Cooldown + hard cap prevent runaway growth
+- Validated: new expert receives 50% of traffic, loss stable post-grow
+
+---
+
+## Persistent Memory
+
+Fractus remembers across sessions. No context window. No forgetting.
+
+```python
+from fractus.memory import PersistentMemory
+
+mem = PersistentMemory(d_model=128, path="~/.fractus/memory.pt")
+engine.attach_memory(mem)
+
+# Session 1: the engine thinks, consolidates salient thoughts
+for token in stream:
+    engine.tick(token)
+mem.save()
+
+# Session 2 (new process, new engine): memories are loaded and injected
+mem2 = PersistentMemory(d_model=128, path="~/.fractus/memory.pt")
+engine2.attach_memory(mem2)  # memories influence the thought state at 5%
+```
+
+The **salience head** learns intrinsically: it predicts how much a memory injection will perturb the thought state (`||h_after - h_before||`). No external labels — the system discovers its own sensitivity to memories.
+
+---
+
+## Cognitive Modes
+
+Modes emerge from the Kuramoto phase dynamics, not from labels:
+
+```python
+from fractus.cognitive_modes import CognitiveModes
+
+modes = CognitiveModes(n_oscillators=8, n_modes=4)
+modes.fit(phase_samples)  # unsupervised k-means → clusters ARE the modes
+modes.label_modes(['focused', 'verbal', 'exploratory', 'procedural'])
+
+result = modes.classify(current_phases)
+# → {"mode": "focused", "confidence": 0.82}
+```
+
+---
+
+## HF Space
+
+Live demo at `huggingface.co/spaces/thefinalboss/Fractus-Space`:
+
+- Chat interface with shared memory across all visitors
+- RAG (textual memory) + PersistentMemory (thought-state memory) coexistence
+- "Thought memories" panel showing the engine's subconscious state
+- `/pmemories` endpoint for transparency
+
+---
+
+## Quick Start
+
+```bash
+git clone https://github.com/AFKmoney/fractus-test.git
+cd fractus-test
+pip install torch numpy tokenizers matplotlib fastapi uvicorn pydantic
+
+# Run the test suite (40+ tests)
+pytest tests/ -q
+
+# Train progressively (paliers 0-1 on CPU)
+python scripts/train_progressive.py --paliers 0,1
+
+# Build a quality corpus (includes Fractus's own source code)
+python scripts/build_quality_corpus.py
+```
+
+---
+
+## Research Findings (honest)
+
+This repository is a laboratory. Not everything worked. The findings are documented for the community:
+
+1. **EDT does not work on Fractus** — pre-training experts independently produces worse models than from-scratch. The objectives (MSE on hidden states) are misaligned with the final CE. ([Full report](experiments/edt_ab/REPORT.md))
+
+2. **Forward-Forward does not work on the CTE** — local goodness signals don't align with next-token prediction. The only signal that works is global CE backprop.
+
+3. **The output head is 94% of training cost** — tied head + head-partial (`tick_chunk_train`) gives 2x speedup. Vocabulary reduction would give 3-6x more.
+
+4. **Kuramoto routing concentrates** — at small scale, only 2/4 experts receive traffic. This is a property of the phase dynamics, not the router parameters.
+
+5. **Progressive growth works** — the model grows palier by palier, inheriting weights via zero-padding. Each palier converges faster than from-scratch.
 
 ---
 
@@ -218,6 +233,8 @@ MIT. This project belongs to the user, not to a corporation.
 
 ## Links
 
-- **GitHub:** [github.com/AFKmoney/fractus](https://github.com/AFKmoney/fractus)
-- **HuggingFace (model):** [huggingface.co/thefinalboss/Fractus](https://huggingface.co/thefinalboss/Fractus)
-- **HuggingFace (Space, private):** [huggingface.co/spaces/thefinalboss/Fractus-Space](https://huggingface.co/spaces/thefinalboss/Fractus-Space)
+- **GitHub (main):** [github.com/AFKmoney/fractus](https://github.com/AFKmoney/fractus)
+- **GitHub (test/experimental):** [github.com/AFKmoney/fractus-test](https://github.com/AFKmoney/fractus-test)
+- **HuggingFace (model):** [huggingface.co/thefinalboss/Fractus-1B](https://huggingface.co/thefinalboss/Fractus-1B)
+- **HuggingFace (Space):** [huggingface.co/spaces/thefinalboss/Fractus-Space](https://huggingface.co/spaces/thefinalboss/Fractus-Space)
+- **White Paper:** [Fractus_White_Paper.pdf](Fractus_White_Paper.pdf) (v1.0, signed)

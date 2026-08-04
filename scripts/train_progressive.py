@@ -24,22 +24,25 @@ from fractus.train.online import OnlineTrainer
 from fractus.grow import grow_cte, grow_summary
 
 CORPUS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                      "data", "communication_corpus.pt")
+                      "data", "quality_corpus.pt")
 
 # The growth ladder. Each palier is bigger than the last.
 # d_model grows ~2x, n_heads keeps d_head=64, experts grow, rank grows.
 PALIERS = [
     # (d_model, n_heads, n_experts, siren_rank, expert_d_ff, tokens, lr)
-    dict(d_model=128,  n_heads=2,  n_experts=4,   siren_rank=32, expert_d_ff=128,  tokens=500_000, lr=3e-4),
-    dict(d_model=256,  n_heads=4,  n_experts=8,   siren_rank=32, expert_d_ff=256,  tokens=500_000, lr=3e-4),
-    dict(d_model=512,  n_heads=8,  n_experts=16,  siren_rank=64, expert_d_ff=512,  tokens=300_000, lr=2e-4),
-    dict(d_model=768,  n_heads=12, n_experts=32,  siren_rank=64, expert_d_ff=768,  tokens=200_000, lr=1e-4),
-    dict(d_model=1280, n_heads=20, n_experts=128, siren_rank=64, expert_d_ff=2048, tokens=0,        lr=1e-4),  # GPU only
+    dict(d_model=128,  n_heads=2,  n_experts=4,   siren_rank=32, expert_d_ff=128,  tokens=2_000_000, lr=1e-3),
+    dict(d_model=256,  n_heads=4,  n_experts=8,   siren_rank=32, expert_d_ff=256,  tokens=1_500_000, lr=5e-4),
+    dict(d_model=512,  n_heads=8,  n_experts=16,  siren_rank=64, expert_d_ff=512,  tokens=1_000_000, lr=3e-4),
+    dict(d_model=768,  n_heads=12, n_experts=32,  siren_rank=64, expert_d_ff=768,  tokens=500_000,   lr=2e-4),
+    dict(d_model=1280, n_heads=20, n_experts=128, siren_rank=64, expert_d_ff=2048, tokens=0,         lr=1e-4),  # GPU only
 ]
 
 
 def train_palier(engine, tokens, n_tokens, lr, palier_name):
-    """Train one palier using the fast OnlineTrainer (chunked, head-last)."""
+    """Train one palier using the fast OnlineTrainer (chunked, head-last).
+
+    Trains in SEGMENTS with periodic logging so we see progress.
+    """
     print(f"\n{'='*60}", flush=True)
     print(f"TRAINING {palier_name}", flush=True)
     print(f"  d_model={engine.d_model}, experts={engine.moe.n_experts}, "
@@ -53,37 +56,38 @@ def train_palier(engine, tokens, n_tokens, lr, palier_name):
         return engine
 
     torch.set_num_threads(os.cpu_count() or 6)
-    trainer = OnlineTrainer(engine, lr=lr)
     chunk_len = 16
+    trainer = OnlineTrainer(engine, lr=lr)
 
+    # Train in segments of 50k tokens each, logging after each.
+    segment_size = min(50_000, n_tokens)
     t0 = time.time()
-    total_loss = 0.0
-    n_chunks = 0
-    log_every = max(n_tokens // (chunk_len * 20), 1)  # ~20 log lines
+    total_processed = 0
+    all_losses = []
 
-    for start in range(0, min(n_tokens, len(tokens) - chunk_len - 1), chunk_len):
-        chunk_tokens = tokens[start:start + n_tokens] if start == 0 else tokens
-        chunk = tokens[start:start + chunk_len]
+    for seg_start in range(0, n_tokens, segment_size):
+        seg_end = min(seg_start + segment_size, n_tokens)
+        seg_tokens = tokens[seg_start:seg_end]
+        if len(seg_tokens) < chunk_len + 2:
+            break
+        result = trainer.train_on_stream_chunked(seg_tokens, chunk_len=chunk_len)
+        processed = result.get("steps", 0)
+        seg_loss = result["avg_loss"]
+        seg_acc = result.get("accuracy", 0)
+        total_processed += processed
+        all_losses.append(seg_loss)
 
-        result = trainer.train_on_stream_chunked(
-            tokens[start:start + chunk_len + chunk_len], chunk_len=chunk_len)
-        total_loss += result["avg_loss"]
-        n_chunks += 1
-
-        if n_chunks % log_every == 0:
-            elapsed = time.time() - t0
-            processed = n_chunks * chunk_len
-            rate = processed / max(elapsed, 1)
-            avg = total_loss / max(n_chunks, 1)
-            ppl = math.exp(min(avg, 20))
-            print(f"  chunk {n_chunks:>6} loss={avg:.3f} ppl={ppl:.1f} "
-                  f"{rate:.0f} tok/s ({processed:,}/{n_tokens:,})", flush=True)
+        elapsed = time.time() - t0
+        rate = total_processed / max(elapsed, 1)
+        ppl = math.exp(min(seg_loss, 20))
+        print(f"  {total_processed:>8,}/{n_tokens:,} loss={seg_loss:.3f} "
+              f"ppl={ppl:.1f} acc={seg_acc:.3f} {rate:.0f} tok/s", flush=True)
 
     elapsed = time.time() - t0
-    avg_loss = total_loss / max(n_chunks, 1)
+    avg_loss = sum(all_losses) / max(len(all_losses), 1)
     ppl = math.exp(min(avg_loss, 20))
     print(f"\n  {palier_name} DONE: loss={avg_loss:.3f} ppl={ppl:.1f} "
-          f"({n_chunks * chunk_len:,} tokens in {elapsed/60:.1f}min)", flush=True)
+          f"({total_processed:,} tokens in {elapsed/60:.1f}min)", flush=True)
 
     return engine
 
@@ -113,8 +117,38 @@ def main():
         config = PALIERS[idx]
         palier_name = f"Palier {idx}"
 
+        # Check for a checkpoint from the PREVIOUS palier.
+        prev_ckpt = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "checkpoints", f"fractus_palier{idx - 1}.pt")
+
+        if engine is None and os.path.exists(prev_ckpt):
+            # Resume from previous palier checkpoint.
+            print(f"\n--- Loading Palier {idx - 1} checkpoint: {prev_ckpt} ---", flush=True)
+            ckpt = torch.load(prev_ckpt, weights_only=False, map_location="cpu")
+            prev_config = ckpt.get("config", {})
+            engine = ContinuousThoughtEngine(
+                vocab_size=50257,
+                d_model=prev_config.get("d_model", 128),
+                n_heads=prev_config.get("n_heads", 2),
+                d_head=prev_config.get("d_head", 64),
+                n_levels=2, n_oscillators=8, coupling_rank=4,
+                n_experts=prev_config.get("n_experts", 4),
+                top_k=2,
+                expert_d_ff=prev_config.get("expert_d_ff", 128),
+                siren_rank=prev_config.get("siren_rank", 32))
+            # Load weights, ignoring buffer size mismatches (kuramoto_phases etc).
+            model_sd = ckpt["model_state"]
+            own_sd = engine.state_dict()
+            for key, val in model_sd.items():
+                if key in own_sd and own_sd[key].shape == val.shape:
+                    own_sd[key] = val
+            engine.load_state_dict(own_sd)
+            print(f"  Loaded: d={engine.d_model}, E={engine.moe.n_experts}, "
+                  f"params={sum(p.numel() for p in engine.parameters()):,}", flush=True)
+
         if engine is None:
-            # Palier 0: build from scratch.
+            # Palier 0: build from scratch (no checkpoint found).
             print(f"\n--- Building {palier_name} from scratch ---", flush=True)
             engine = ContinuousThoughtEngine(
                 vocab_size=50257, d_model=config["d_model"],
@@ -123,8 +157,8 @@ def main():
                 n_experts=config["n_experts"], top_k=2,
                 expert_d_ff=config["expert_d_ff"],
                 siren_rank=config["siren_rank"])
-        else:
-            # Grow from previous palier.
+        elif engine.d_model < config["d_model"] or engine.moe.n_experts < config["n_experts"]:
+            # Grow from previous palier (in-memory or just-loaded checkpoint).
             print(f"\n--- Growing to {palier_name} ---", flush=True)
             grow_config = dict(
                 d_model=config["d_model"],
@@ -135,8 +169,10 @@ def main():
                 expert_d_ff=config["expert_d_ff"],
             )
             engine = grow_cte(engine, grow_config)
-            for k, v in grow_summary(engine, engine).items():
-                pass  # summary printed by grow itself
+            print(f"  Grown: d={engine.d_model}, E={engine.moe.n_experts}, "
+                  f"params={sum(p.numel() for p in engine.parameters()):,}", flush=True)
+        else:
+            print(f"\n--- {palier_name} already at target config, training in place ---", flush=True)
             print(f"  Grown: d={engine.d_model}, E={engine.moe.n_experts}, "
                   f"params={sum(p.numel() for p in engine.parameters()):,}", flush=True)
 

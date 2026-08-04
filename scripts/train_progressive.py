@@ -38,7 +38,7 @@ PALIERS = [
 ]
 
 
-def train_palier(engine, tokens, n_tokens, lr, palier_name):
+def train_palier(engine, tokens, n_tokens, lr, palier_name, accumulation_steps=8):
     """Train one palier using the fast OnlineTrainer (chunked, head-last).
 
     Trains in SEGMENTS with periodic logging so we see progress.
@@ -56,8 +56,8 @@ def train_palier(engine, tokens, n_tokens, lr, palier_name):
         return engine
 
     torch.set_num_threads(os.cpu_count() or 6)
-    chunk_len = 16
-    trainer = OnlineTrainer(engine, lr=lr)
+    chunk_len = 32  # larger chunk = better amortization of Python overhead
+    trainer = OnlineTrainer(engine, lr=lr, accumulation_steps=accumulation_steps)
 
     # Train in segments of 50k tokens each, logging after each.
     segment_size = min(50_000, n_tokens)
@@ -99,6 +99,10 @@ def main():
     ap.add_argument("--tokens-per-palier", type=int, default=None,
                     help="override tokens per palier (for quick tests)")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--accumulation-steps", type=int, default=8,
+                    help="gradient accumulation steps (fewer optimizer steps = faster)")
+    ap.add_argument("--compile", action="store_true",
+                    help="enable torch.compile on tick_chunk_train (reduce-overhead mode)")
     args = ap.parse_args()
 
     palier_indices = [int(x) for x in args.paliers.split(",")]
@@ -107,6 +111,8 @@ def main():
     print("=== Fractus Progressive Growth ===", flush=True)
     print(f"Paliers: {palier_indices}", flush=True)
     print(f"Seed: {args.seed}", flush=True)
+    print(f"Accumulation steps: {args.accumulation_steps}", flush=True)
+    print(f"Compile: {args.compile}", flush=True)
 
     # Load corpus.
     tokens = torch.load(CORPUS, weights_only=False).to(torch.int64)
@@ -176,9 +182,16 @@ def main():
             print(f"  Grown: d={engine.d_model}, E={engine.moe.n_experts}, "
                   f"params={sum(p.numel() for p in engine.parameters()):,}", flush=True)
 
+        # torch.compile (optional — reduces Python overhead on repeated calls).
+        if args.compile:
+            print(f"  Compiling tick_chunk_train (reduce-overhead)...", flush=True)
+            engine.tick_chunk_train = torch.compile(
+                engine.tick_chunk_train, mode="reduce-overhead")
+
         # Train this palier.
         n_tokens = args.tokens_per_palier or config["tokens"]
-        engine = train_palier(engine, tokens, n_tokens, config["lr"], palier_name)
+        engine = train_palier(engine, tokens, n_tokens, config["lr"], palier_name,
+                              accumulation_steps=args.accumulation_steps)
 
         # Save checkpoint.
         ckpt_path = os.path.join(

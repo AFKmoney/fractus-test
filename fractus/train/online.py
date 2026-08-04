@@ -40,8 +40,10 @@ class OnlineTrainer:
         engine,
         lr: float = 1e-3,
         weight_decay: float = 0.01,
+        accumulation_steps: int = 8,
     ):
         self.engine = engine
+        self.accumulation_steps = max(accumulation_steps, 1)
         self.optimizer = torch.optim.AdamW(engine.parameters(), lr=lr,
                                            weight_decay=weight_decay)
         self.step_count = 0
@@ -185,29 +187,45 @@ class OnlineTrainer:
         correct = 0
         total = 0
 
+        # Gradient accumulation: backward every chunk, step every accumulation_steps chunks.
+        accum = self.accumulation_steps
+        self.optimizer.zero_grad()
+        chunk_idx = 0
+
         for start in range(0, len(token_ids) - chunk_len - 1, chunk_len):
             chunk = token_ids[start:start + chunk_len].unsqueeze(0)  # (1, C)
 
             # Fast training path: head on LAST position only.
-            # The chunk builds context; prediction is on the final thought state.
             last_logits = self.engine.tick_chunk_train(chunk)  # (1, vocab)
             target = token_ids[start + chunk_len]  # scalar: the token after the chunk
 
-            # CE on the single predicted token.
-            loss = F.cross_entropy(last_logits, target.unsqueeze(0))
+            # CE on the single predicted token (scaled by 1/accum for correct averaging).
+            loss = F.cross_entropy(last_logits, target.unsqueeze(0)) / accum
 
-            # One backward + step per chunk.
-            self.optimizer.zero_grad()
+            # Backward every chunk (gradients accumulate).
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.engine.parameters(), 1.0)
-            self.optimizer.step()
-            self.step_count += 1
 
-            total_loss += loss.item()
+            total_loss += loss.item() * accum  # un-scale for logging
             pred = last_logits.argmax(dim=-1)
             correct += (pred == target.unsqueeze(0)).sum().item()
             total += 1
-            self.losses.append(loss.item())
+            self.losses.append(loss.item() * accum)
+
+            chunk_idx += 1
+
+            # Step only every accumulation_steps chunks.
+            if chunk_idx % accum == 0:
+                torch.nn.utils.clip_grad_norm_(self.engine.parameters(), 1.0)
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                self.step_count += 1
+
+        # Handle the remainder: if chunks aren't a clean multiple of accum, do a final step.
+        if chunk_idx % accum != 0:
+            torch.nn.utils.clip_grad_norm_(self.engine.parameters(), 1.0)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            self.step_count += 1
 
         return {
             "avg_loss": total_loss / max(total, 1),

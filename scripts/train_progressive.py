@@ -56,38 +56,63 @@ def train_palier(engine, tokens, n_tokens, lr, palier_name, accumulation_steps=8
         return engine
 
     torch.set_num_threads(os.cpu_count() or 6)
-    chunk_len = 32  # larger chunk = better amortization of Python overhead
+    chunk_len = 32
     trainer = OnlineTrainer(engine, lr=lr, accumulation_steps=accumulation_steps)
 
-    # Train in segments of 50k tokens each, logging after each.
-    segment_size = min(50_000, n_tokens)
+    # Train in ONE pass over n_tokens, with inline logging every ~50k tokens.
+    train_tokens = tokens[:n_tokens]
+    log_interval = max(50_000 // chunk_len, 1)  # log every ~50k tokens worth of chunks
+
     t0 = time.time()
-    total_processed = 0
-    all_losses = []
+    import torch.nn.functional as F
+    total_loss = 0.0
+    total_correct = 0
+    total_n = 0
+    chunk_idx = 0
+    accum = accumulation_steps
+    trainer.optimizer.zero_grad()
 
-    for seg_start in range(0, n_tokens, segment_size):
-        seg_end = min(seg_start + segment_size, n_tokens)
-        seg_tokens = tokens[seg_start:seg_end]
-        if len(seg_tokens) < chunk_len + 2:
-            break
-        result = trainer.train_on_stream_chunked(seg_tokens, chunk_len=chunk_len)
-        processed = result.get("steps", 0)
-        seg_loss = result["avg_loss"]
-        seg_acc = result.get("accuracy", 0)
-        total_processed += processed
-        all_losses.append(seg_loss)
+    for start in range(0, len(train_tokens) - chunk_len - 1, chunk_len):
+        chunk = train_tokens[start:start + chunk_len].unsqueeze(0)
+        target = train_tokens[start + chunk_len]
+        last_logits = engine.tick_chunk_train(chunk)
+        loss = F.cross_entropy(last_logits, target.unsqueeze(0)) / accum
+        loss.backward()
 
-        elapsed = time.time() - t0
-        rate = total_processed / max(elapsed, 1)
-        ppl = math.exp(min(seg_loss, 20))
-        print(f"  {total_processed:>8,}/{n_tokens:,} loss={seg_loss:.3f} "
-              f"ppl={ppl:.1f} acc={seg_acc:.3f} {rate:.0f} tok/s", flush=True)
+        total_loss += loss.item() * accum
+        pred = last_logits.argmax(dim=-1)
+        total_correct += (pred == target.unsqueeze(0)).sum().item()
+        total_n += 1
+        chunk_idx += 1
+
+        if chunk_idx % accum == 0:
+            torch.nn.utils.clip_grad_norm_(engine.parameters(), 1.0)
+            trainer.optimizer.step()
+            trainer.optimizer.zero_grad()
+            trainer.step_count += 1
+
+        if chunk_idx % log_interval == 0:
+            processed = chunk_idx * chunk_len
+            elapsed = time.time() - t0
+            rate = processed / max(elapsed, 1)
+            avg = total_loss / max(total_n, 1)
+            acc = total_correct / max(total_n, 1)
+            ppl = math.exp(min(avg, 20))
+            print(f"  {processed:>8,}/{n_tokens:,} loss={avg:.3f} "
+                  f"ppl={ppl:.1f} acc={acc:.3f} {rate:.0f} tok/s", flush=True)
+
+    # Final remainder step.
+    if chunk_idx % accum != 0:
+        torch.nn.utils.clip_grad_norm_(engine.parameters(), 1.0)
+        trainer.optimizer.step()
+        trainer.optimizer.zero_grad()
 
     elapsed = time.time() - t0
-    avg_loss = sum(all_losses) / max(len(all_losses), 1)
+    avg_loss = total_loss / max(total_n, 1)
     ppl = math.exp(min(avg_loss, 20))
     print(f"\n  {palier_name} DONE: loss={avg_loss:.3f} ppl={ppl:.1f} "
-          f"({total_processed:,} tokens in {elapsed/60:.1f}min)", flush=True)
+          f"({chunk_idx * chunk_len:,} tokens in {elapsed/60:.1f}min, "
+          f"{chunk_idx * chunk_len / max(elapsed,1):.0f} tok/s)", flush=True)
 
     return engine
 

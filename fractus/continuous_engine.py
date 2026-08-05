@@ -378,10 +378,14 @@ class ContinuousThoughtEngine(nn.Module):
         h = h + attn_out
 
         # 2. Kuramoto: advance phases from the chunk's hidden states.
-        h_kur = self.norm_kur(h)
-        theta = self.kuramoto._encode_from_hidden(h_kur)
-        theta = self.kuramoto._rk4_integrate(theta)
-        self.kuramoto_phases = theta.detach()
+        # Detached from autograd — Kuramoto is a clock, not a learned transform.
+        # Its gradients are not needed (the MoE gates learn to USE the phases,
+        # the phases themselves are deterministic from the hidden state).
+        with torch.no_grad():
+            h_kur = self.norm_kur(h)
+            theta = self.kuramoto._encode_from_hidden(h_kur)
+            theta = self.kuramoto._rk4_integrate(theta)
+        self.kuramoto_phases = theta
 
         # 3. MoE: transform the chunk, routed by the last-position Kuramoto phase.
         h_moe = self.norm_moe(h)                         # (B, C, d_model)

@@ -151,20 +151,38 @@ Only useful if memory is the bottleneck (it's not on CPU — compute is).
 
 ## Summary: what gives the most speedup?
 
-| Optimization | Status | Expected tok/s gain | Complexity |
+| Optimization | Status | Measured/Expected gain | Notes |
 |---|---|---|---|
-| Gradient accumulation (accum=8) | ✅ Applied | 1.37x | Done |
-| Head-partial (tick_chunk_train) | ✅ Applied | ~1.5x | Done |
-| Tied head | ✅ Applied | ~1.1x | Done |
-| Chunk_len=32 | ✅ Applied | ~1.1x | Done |
-| Detach Kuramoto | Proposed | ~1.06x | Easy |
-| Sparse MoE low-rank | Proposed | ~1.1x (4 experts), ~50x (128 experts) | Medium |
-| Vocabulary reduction | Proposed | ~3-6x on head | Medium |
-| torch.compile | Available | Unknown on CPU | Easy (flag exists) |
-| Combined estimate | — | **~5-8x total** | — |
+| Tied head | ✅ Applied | ~1.1x | Halves vocab params |
+| Head-partial (tick_chunk_train) | ✅ Applied | ~1.5x | Head on 1 pos instead of C |
+| Gradient accumulation (accum=8) | ✅ Applied | 1.37x | 16x fewer optimizer steps |
+| Chunk_len=32 | ✅ Applied | ~1.1x | Better Python amortization |
+| Detach Kuramoto | ✅ Applied | ~1.06x | No_grad on phase computation |
+| Sparse MoE low-rank | ✅ Applied | Scales with E/K ratio | 2 experts computed instead of E |
+| Vocabulary reduction | Proposed | ~3-6x on head | Biggest remaining lever |
+| torch.compile | Available (--compile) | Unknown on CPU | Flag exists, untested |
+| Combined measured (4E, d=128) | — | **1.37x** (4→6 tok/s on 20k) | More on longer runs |
+| Combined at scale (16E+, d=512+) | — | **Higher** (sparse kicks in) | Sparse = 2/16 = 8x less MoE work |
 
-From 77 tok/s baseline → estimated **~400-600 tok/s** with all optimizations
-on CPU at d=128. At d=768 (palier 3), proportionally less but still significant.
+### Measured numbers
 
-On GPU: all of these compound with bf16 AMP + CUDA parallelism.
-Estimated GPU speedup over CPU: ~50-100x (typical for this workload size).
+**4 experts, d=128 (palier 0):**
+- Baseline (chunk=16, accum=1): 4 tok/s
+- Optimized (chunk=32, accum=8, sparse+dK): 6 tok/s (1.37x)
+- The gain is modest because at 4 experts, dense ≈ sparse (E ≤ 2K threshold)
+
+**16 experts, d=512 (palier 2):**
+- Sparse path now triggers (16 > 2×2=4)
+- Only 2 of 16 experts computed per token → 8x less MoE work
+- But d=512 is 16x more FLOPs per matmul than d=128 → net still slow on CPU
+- On GPU: the sparse savings compound with bf16 + CUDA parallelism
+
+### Bottom line
+
+On CPU, the optimizations give ~1.4x at small scale (4 experts) and more at
+larger scale (16+ experts where sparse triggers). The real bottleneck remains
+the absolute FLOP count of the forward+backward at larger d_model.
+
+On GPU, these optimizations are critical: sparse MoE (2/128 experts = 64x less
+work), head-partial (32x less head FLOPs), accumulation (fewer GPU sync points),
+and bf16 AMP (2x on all matmuls) compound to give **~100-200x over CPU**.

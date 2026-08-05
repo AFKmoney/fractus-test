@@ -208,22 +208,44 @@ class PhaseRoutedMoE(nn.Module):
         K = topk_idx.shape[-1]
 
         # Gather the K selected experts' weights PER TOKEN.
-        # w1: (E, D, F) → w1_sel: (B, L, K, D, F)
-        # topk_idx: (B, L, K) → expand to (B, L, K, D, F) for gather on dim 0 of a flat view.
-        # Cleanest: flatten (B,L,K) indices and use index_select on the expert dim.
         flat_idx = topk_idx.reshape(-1)  # (B*L*K,)
+
+        if self.expert_rank is not None:
+            # Sparse LOW-RANK path: gather U/V/scale factors, compute 2 matmuls per expert.
+            # This computes only K experts instead of E — at top-k=2, E=128, that's 64x less work.
+            r = self.expert_rank
+            g_U1 = self.U1.index_select(0, flat_idx).reshape(B*L, K, self.d_ff, r)
+            g_V1 = self.V1.index_select(0, flat_idx).reshape(B*L, K, D, r)
+            g_s1 = self.scale1.index_select(0, flat_idx).reshape(B*L, K, 1, 1)
+            g_b1 = self.b1.index_select(0, flat_idx).reshape(B*L, K, self.d_ff)
+            g_U2 = self.U2.index_select(0, flat_idx).reshape(B*L, K, D, r)
+            g_V2 = self.V2.index_select(0, flat_idx).reshape(B*L, K, self.d_ff, r)
+            g_s2 = self.scale2.index_select(0, flat_idx).reshape(B*L, K, 1, 1)
+            g_b2 = self.b2.index_select(0, flat_idx).reshape(B*L, K, D)
+
+            # Layer 1: flatten B,L → N=B*L for einsum over K experts.
+            N = B * L
+            h_flat = h.reshape(N, D)  # (N, D)
+            # hV1[n,k,r] = Σ_d h_flat[n,d] · g_V1[n,k,d,r]
+            hV1 = torch.einsum('nd,nkdr->nkr', h_flat, g_V1)  # (N, K, r)
+            # h1[n,k,f] = scale1 · Σ_r hV1[r] · U1[f,r] + b1
+            h1 = g_s1.squeeze(-1) * torch.einsum('nkr,nkfr->nkf', hV1, g_U1) + g_b1  # (N, K, F)
+            h1_act = _gelu(h1)
+
+            # Layer 2: out[n,k,d] = scale2 · Σ_r (h1_act @ V2)[r] · U2[d,r] + b2
+            hV2 = torch.einsum('nkf,nkfr->nkr', h1_act, g_V2)  # (N, K, r)
+            out = g_s2.squeeze(-1) * torch.einsum('nkr,nkdr->nkd', hV2, g_U2) + g_b2  # (N, K, D)
+            return out.reshape(B, L, K, D)
+
+        # Dense sparse path (original).
         w1_sel = self.w1.index_select(0, flat_idx).reshape(B, L, K, D, self.d_ff)
         b1_sel = self.b1.index_select(0, flat_idx).reshape(B, L, K, self.d_ff)
         w2_sel = self.w2.index_select(0, flat_idx).reshape(B, L, K, self.d_ff, D)
         b2_sel = self.b2.index_select(0, flat_idx).reshape(B, L, K, D)
 
-        # h: (B, L, D) → (B, L, 1, D, 1) broadcast over the K dim.
-        # w1_sel is (B, L, K, D, F): align D at dim -2.
         h_exp = h.unsqueeze(2).unsqueeze(-1)  # (B, L, 1, D, 1)
-        # h1[b,l,k,f] = Σ_d h[b,l,d] · w1_sel[b,l,k,d,f]
         h1 = (h_exp * w1_sel).sum(dim=-2) + b1_sel  # (B, L, K, F)
         h1_act = _gelu(h1)
-        # out[b,l,k,d] = Σ_f h1_act[b,l,k,f] · w2_sel[b,l,k,f,d]
         h1_act_exp = h1_act.unsqueeze(-1)  # (B, L, K, F, 1)
         out = (h1_act_exp * w2_sel).sum(dim=-2) + b2_sel  # (B, L, K, D)
         return out
@@ -274,9 +296,7 @@ class PhaseRoutedMoE(nn.Module):
         Measured: for E=4,K=2 the dense path is ~1.5× faster than sparse; for
         E=32,K=8 the sparse path wins. The 2× threshold is the empirical knee.
 
-        Low-rank mode (expert_rank is not None) is dense-only in this
-        iteration (spec D2): if a config would have selected sparse, it falls
-        back to dense with a one-time warning. The 13M AB test uses dense
+        Sparse now supports BOTH dense and low-rank expert modes.
         (E=4 <= 2·K=4), so this covers it.
         """
         gates = self._compute_gates(phases)  # (B, L, E)
@@ -289,20 +309,7 @@ class PhaseRoutedMoE(nn.Module):
         )
 
         # Adaptive: dense when small E (einsum wins on CPU), sparse when large E.
-        # Low-rank mode is dense-only in this iteration (spec D2): the
-        # gather-first sparse dispatch is not wired through the LoRA factors.
-        # If the config would have selected sparse, fall back to dense and warn
-        # once. (The 13M AB test uses E=4 <= 2·K=4, so it always hits dense.)
-        if self.expert_rank is not None and self.n_experts > 2 * self.top_k:
-            import warnings
-            warnings.warn(
-                "PhaseRoutedMoE: low-rank sparse dispatch not implemented; "
-                "falling back to dense forward.",
-                stacklevel=2,
-            )
-            use_sparse = False
-        else:
-            use_sparse = self.n_experts > 2 * self.top_k
+        use_sparse = self.n_experts > 2 * self.top_k
         if use_sparse:
             topk_out = self._sparse_expert_forward(h, topk_idx)  # (B, L, K, d_model)
         else:

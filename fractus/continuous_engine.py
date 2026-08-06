@@ -328,12 +328,12 @@ class ContinuousThoughtEngine(nn.Module):
         observations: (B, C) where C = chunk_len (e.g. 16).
         Returns logits: (B, C, vocab).
 
-        This is the KEY SPEED OPTIMIZATION. Instead of calling tick() C times
-        (C forward passes + C backward passes), we do ONE forward over the whole
-        chunk. The attention state (S,z) is carried forward via the L8 state-carry
-        mechanism — accumulated within the chunk, then detached for the next chunk.
+        CONTINUOUS THOUGHT: the attention state (S, z) is carried across chunk
+        boundaries via the L8 state-carry mechanism. Each chunk's attention
+        STARTS from the previous chunk's accumulated state — the thought is
+        truly continuous, not reset per chunk.
 
-        The thought state evolves across the whole chunk in a single graph.
+        The thought state also carries (thought_state buffer).
         """
         B, C = observations.shape
         D = self.d_model
@@ -344,8 +344,7 @@ class ContinuousThoughtEngine(nn.Module):
         h = obs_vecs.clone()
         h[:, 0, :] = h[:, 0, :] + self.thought_state[:, 0, :]
 
-        # 1. Attention: process the chunk with the accumulated state.
-        # We use the L8 batched attention (heads×levels flattened).
+        # 1. Attention: process the chunk with CARRIED state from previous chunk.
         attn = self.attn
         nH, dH, nL = attn.n_heads, attn.d_head, attn.n_levels
         h_normed = self.norm_attn(h)
@@ -365,11 +364,31 @@ class ContinuousThoughtEngine(nn.Module):
         q_flat = q_feat.permute(0, 1, 3, 2, 4).reshape(B * nL * nH, C, dH)
         k_flat = k_feat.permute(0, 1, 3, 2, 4).reshape(B * nL * nH, C, dH)
         v_flat = v_lev.permute(0, 1, 3, 2, 4).reshape(B * nL * nH, C, dH)
-        # Vectorized causal attention. For chunk processing we skip the
-        # cross-chunk state carry (the S,z would need per-head bookkeeping
-        # which adds complexity). The chunk is long enough (16 tokens) that
-        # intra-chunk attention captures sufficient context.
-        y_flat = attn._linear_attention_causal_vectorized(q_flat, k_flat, v_flat)
+
+        # CARRY (S, z) from previous chunk — continuous thought across boundaries.
+        # attn_S is (B, nH*dH, nH*dH). Extract each head's diagonal block.
+        carry_S_per_head = torch.stack([
+            self.attn_S[:, hd*dH:(hd+1)*dH, hd*dH:(hd+1)*dH] for hd in range(nH)
+        ], dim=1)  # (B, nH, dH, dH)
+        carry_z_per_head = torch.stack([
+            self.attn_z[:, hd*dH:(hd+1)*dH] for hd in range(nH)
+        ], dim=1)  # (B, nH, dH)
+        carry_S_flat = carry_S_per_head.unsqueeze(1).expand(B, nL, nH, dH, dH).reshape(B * nL * nH, dH, dH)
+        carry_z_flat = carry_z_per_head.unsqueeze(1).expand(B, nL, nH, dH).reshape(B * nL * nH, dH)
+
+        y_flat, (S_final, z_final) = attn._linear_attention_causal_vectorized(
+            q_flat, k_flat, v_flat, carry=(carry_S_flat, carry_z_flat))
+
+        # Save final state: rebuild (B, nH*dH, nH*dH) from per-head blocks.
+        S_reshaped = S_final.reshape(B, nL, nH, dH, dH).mean(dim=1)  # (B, nH, dH, dH)
+        z_reshaped = z_final.reshape(B, nL, nH, dH).mean(dim=1)     # (B, nH, dH)
+        new_S = torch.zeros(B, nH * dH, nH * dH, device=h.device, dtype=h.dtype)
+        new_z = torch.zeros(B, nH * dH, device=h.device, dtype=h.dtype)
+        for hd in range(nH):
+            new_S[:, hd*dH:(hd+1)*dH, hd*dH:(hd+1)*dH] = S_reshaped[:, hd]
+            new_z[:, hd*dH:(hd+1)*dH] = z_reshaped[:, hd]
+        self.attn_S = new_S.detach()
+        self.attn_z = new_z.detach()
 
         y = y_flat.reshape(B, nL, nH, C, dH).permute(0, 1, 3, 2, 4).reshape(B, nL, C, nH * dH)
         level_weights = torch.softmax(attn.level_logits, dim=-1)
@@ -417,9 +436,6 @@ class ContinuousThoughtEngine(nn.Module):
         # but we only need the last position. To avoid computing the head on all
         # positions, we replicate tick_chunk's body but compute the head only
         # on h[:, -1:, :].
-        # NOTE: we can't call tick_chunk() and slice because that would compute
-        # the head on all 16 positions — defeating the purpose. So we inline the
-        # forward here, stopping before the head.
         B, C = observations.shape
         D = self.d_model
 
@@ -446,19 +462,42 @@ class ContinuousThoughtEngine(nn.Module):
         q_flat = q_feat.permute(0, 1, 3, 2, 4).reshape(B * nL * nH, C, dH)
         k_flat = k_feat.permute(0, 1, 3, 2, 4).reshape(B * nL * nH, C, dH)
         v_flat = v_lev.permute(0, 1, 3, 2, 4).reshape(B * nL * nH, C, dH)
-        y_flat = attn._linear_attention_causal_vectorized(q_flat, k_flat, v_flat)
+
+        # CARRY (S, z) — continuous thought across chunk boundaries.
+        carry_S_per_head = torch.stack([
+            self.attn_S[:, hd*dH:(hd+1)*dH, hd*dH:(hd+1)*dH] for hd in range(nH)
+        ], dim=1)
+        carry_z_per_head = torch.stack([
+            self.attn_z[:, hd*dH:(hd+1)*dH] for hd in range(nH)
+        ], dim=1)
+        carry_S_flat = carry_S_per_head.unsqueeze(1).expand(B, nL, nH, dH, dH).reshape(B * nL * nH, dH, dH)
+        carry_z_flat = carry_z_per_head.unsqueeze(1).expand(B, nL, nH, dH).reshape(B * nL * nH, dH)
+        y_flat, (S_final, z_final) = attn._linear_attention_causal_vectorized(
+            q_flat, k_flat, v_flat, carry=(carry_S_flat, carry_z_flat))
+
+        S_reshaped = S_final.reshape(B, nL, nH, dH, dH).mean(dim=1)
+        z_reshaped = z_final.reshape(B, nL, nH, dH).mean(dim=1)
+        new_S = torch.zeros(B, nH * dH, nH * dH, device=h.device, dtype=h.dtype)
+        new_z = torch.zeros(B, nH * dH, device=h.device, dtype=h.dtype)
+        for hd in range(nH):
+            new_S[:, hd*dH:(hd+1)*dH, hd*dH:(hd+1)*dH] = S_reshaped[:, hd]
+            new_z[:, hd*dH:(hd+1)*dH] = z_reshaped[:, hd]
+        self.attn_S = new_S.detach()
+        self.attn_z = new_z.detach()
+
         y = y_flat.reshape(B, nL, nH, C, dH).permute(0, 1, 3, 2, 4).reshape(B, nL, C, nH * dH)
         level_weights = torch.softmax(attn.level_logits, dim=-1)
         attn_out = (y * level_weights.view(1, nL, 1, 1)).sum(dim=1)
         attn_out = attn_out @ attn.w_out + attn.b_out
         h = h + attn_out
 
-        # 2. Kuramoto.
-        h_kur = self.norm_kur(h)
-        theta = self.kuramoto._encode_from_hidden(h_kur)
-        theta = theta + 0.1 * self.kuramoto._derivative(theta)
-        theta = torch.remainder(theta, self.kuramoto.TWO_PI)
-        self.kuramoto_phases = theta.detach()
+        # 2. Kuramoto: advance phases from the chunk's hidden states.
+        # Detached from autograd — Kuramoto is a clock, not a learned transform.
+        with torch.no_grad():
+            h_kur = self.norm_kur(h)
+            theta = self.kuramoto._encode_from_hidden(h_kur)
+            theta = self.kuramoto._rk4_integrate(theta)
+        self.kuramoto_phases = theta
 
         # 3. MoE.
         h_moe = self.norm_moe(h)

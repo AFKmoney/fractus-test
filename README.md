@@ -28,9 +28,11 @@ tick(observation):
   6. Confidence: decide whether to emit output
 ```
 
+**Multi-block depth**: the engine stacks N `CTEBlock`s, each with its own attention state (S,z), Kuramoto phases, and PhaseRoutedMoE. The thought flows through the stack as a residual stream — each block refines it. Default `n_layers=1` (retrocompatible); set `n_layers=16` for a 1B-scale model.
+
 **Adaptive depth**: easy inputs = 1 tick, hard inputs = many ticks. Energy-proportional reasoning.
 
-**Chunk-based training**: `tick_chunk_train` processes 32 tokens per forward, but the output head runs only on the **last position** (32x less head FLOPs). The thought state carries forward between chunks (detached — no BPTT).
+**Chunk-based training**: `tick_chunk_train` processes 32 tokens per forward, but the output head runs only on the **last position** (32x less head FLOPs). The thought state AND per-block attention state (S,z) carry forward between chunks — **continuous thought** verified across all paths.
 
 ### PhaseRoutedMoE (Sparse, Low-Rank, Differentiable)
 
@@ -45,13 +47,13 @@ The MoE routes tokens via **Kuramoto oscillator phases** and a **von Mises gate*
 
 Instead of training 1B from scratch (months on GPU), Fractus **grows palier by palier**:
 
-| Palier | d_model | experts | params | CPU tok/s | GPU tok/s (est.) |
-|---|---|---|---|---|---|
-| 0 | 128 | 4 | 6.6M | **707** | ~3000 |
-| 1 | 256 | 8 | 13.4M | ~350 | ~1800 |
-| 2 | 512 | 16 | 28.9M | ~100 | ~800 |
-| 3 | 768 | 32 | 47.3M | ~30 | ~400 |
-| **4** | **1280** | **128** | **~1B** | — | **~200** |
+| Palier | d_model | blocks | experts/block | params | CPU tok/s | GPU tok/s (est.) |
+|---|---|---|---|---|---|---|
+| 0 | 128 | 1 | 4 | 6.6M | **707** | ~3000 |
+| 1 | 256 | 2 | 8 | ~25M | ~350 | ~1800 |
+| 2 | 512 | 4 | 16 | ~120M | ~100 | ~800 |
+| 3 | 768 | 8 | 32 | ~350M | ~30 | ~400 |
+| **4** | **1280** | **16** | **128** | **~1B** | — | **~200** |
 
 Each palier inherits the previous weights via **zero-padding** (`fractus/grow.py`). Old knowledge is preserved (top-left block of every matrix), new capacity starts neutral (zeros for weights, ones for LayerNorm gamma). The model never starts from random — it starts warm.
 
@@ -206,6 +208,7 @@ result = modes.classify(phases)  # → {"mode": "focused", "confidence": 0.82}
 | **Self-modification** | ✅ Works | add_expert + maybe_grow, stability validated |
 | **Persistent memory** | ✅ Works | Cross-session persistence, salience head trained |
 | **707 tok/s on CPU** | ✅ Measured | All optimizations combined (was 4 tok/s before) |
+| **Multi-block CTE** | ✅ Works | Gradient flows through all blocks, per-block (S,z) continuous |
 
 Full report: `experiments/edt_ab/REPORT.md`. Optimization analysis: `docs/TRAINING_OPTIMIZATION.md`.
 
